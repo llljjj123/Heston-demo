@@ -10,4 +10,7 @@ Use ADI scheme to price 3 different commonly traded structures on Chinese market
 The notebook to work with, integrated calibration and pricing/greeks calculation.
 
 `vol_surface.xlsx`:  
-The implied vol surface file downloaded from `wind`. You may replace it with iv surface from any source.# Heston-demo
+The implied vol surface file downloaded from `wind`. You may replace it with iv surface from any source.
+
+`heston_calibrated_params.csv`
+Historical Heston parameters used in new calibration if `use_historical` is set to `True`.

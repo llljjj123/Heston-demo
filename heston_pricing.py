@@ -1,8 +1,10 @@
-"""Heston ADI structured-product pricing and finite-difference Greeks.
+"""Heston ADI structured-product pricing, node Greeks and Rannacher smoothing.
 
-The public pricing functions return scalar prices. Dividend input may be a
-constant yield, a DividendCarryCurve, or an effective-yield array accompanied
-by matching maturities.
+The public pricing functions return scalar prices, or the solved surface with
+return_surface=True. calculate_greeks differentiates that single surface at
+(S0, v0) instead of repricing bumped inputs. Dividend input may be a constant
+yield, a DividendCarryCurve, or an effective-yield array accompanied by
+matching maturities.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ __all__ = [
     "calculate_greeks",
     "dividend_rate_for_tau_step",
     "heston_adi_step",
+    "node_greeks",
     "prepare_dividend_input",
     "price_autocallable_heston",
     "price_phoenix_heston",
@@ -81,7 +84,7 @@ def dividend_rate_for_tau_step(q_input, T, tau_start, tau_end):
     raise TypeError("q_input must be a scalar or provide cumulative_carry()")
 
 
-@njit(cache=False)
+@njit(cache=True)
 def thomas_algorithm(a, b, c, d):
     """Solve tridiagonal system Mx=d (scalar, kept for compatibility)."""
     n = len(b)
@@ -101,7 +104,7 @@ def thomas_algorithm(a, b, c, d):
     return x
 
 
-@njit(cache=False)
+@njit(cache=True)
 def thomas_algorithm_batch(a, b, c, d):
     """Batched Thomas solve: a (B,n-1), b (B,n), c (B,n-1), d (B,n) -> x (B,n)."""
     n = b.shape[1]
@@ -123,9 +126,160 @@ def thomas_algorithm_batch(a, b, c, d):
     return x
 
 
-# ---------- ADI step (vectorized) ----------
-@njit(cache=False)
-def heston_adi_step(
+# ---------- Prepared Douglas ADI operator ----------
+@njit(cache=True)
+def _prepare_adi(dt, S, dS, v, dv, r, q, kappa, theta, sigma_v, weight=0.5):
+    """Factor invariant spot matrices and the shared variance matrix once.
+
+    weight is the implicit-correction weight: 0.5 for the Crank-Nicolson step,
+    1.0 for a backward-Euler half-step. Only the product weight*dt enters.
+    """
+    n, nv = len(S) - 2, len(v)
+    half = weight * dt
+    ds2, dv2 = dS * dS, dv * dv
+    forward = (r - q) * S[1] >= 0.
+    lower_s = np.empty((n, nv))
+    denominator_s = np.empty((n, nv))
+    cp_s = np.empty((n - 1, nv))
+    for row in range(n):
+        i = row + 1
+        drift = (r - q) * S[i]
+        if forward:
+            lm, li, lp = 0., -drift / dS, drift / dS
+        else:
+            lm, li, lp = -drift / dS, drift / dS, 0.
+        for j in range(nv):
+            D = .5 * v[j] * (S[i] * S[i]) / ds2
+            a = -half * (lm + D)
+            b = 1. - half * (li - 2. * D)
+            c = -half * (lp + D)
+            if row == n - 1:
+                a -= c
+                b += 2. * c
+            lower_s[row, j] = a
+            denominator = b if row == 0 else b - a * cp_s[row - 1, j]
+            denominator_s[row, j] = denominator
+            if row < n - 1:
+                cp_s[row, j] = c / denominator
+
+    drift_v = kappa * (theta - v)
+    diffusion_v = .5 * sigma_v * sigma_v * v
+    lower_v = np.empty(nv)
+    denominator_v = np.empty(nv)
+    cp_v = np.empty(nv - 1)
+    for j in range(nv):
+        if j == 0:
+            lm, li, lp = 0., -drift_v[0] / dv, drift_v[0] / dv
+        elif j == nv - 1:
+            lm, li, lp = -drift_v[-1] / dv, drift_v[-1] / dv, 0.
+        else:
+            D = .5 * sigma_v * sigma_v * v[j] / dv2
+            lm = -drift_v[j] / (2. * dv) + D
+            li = -2. * D
+            lp = drift_v[j] / (2. * dv) + D
+        a = -half * lm
+        b = 1. - half * li
+        c = -half * lp
+        lower_v[j] = a
+        denominator = b if j == 0 else b - a * cp_v[j - 1]
+        denominator_v[j] = denominator
+        if j < nv - 1:
+            cp_v[j] = c / denominator
+    return lower_s, denominator_s, cp_s, lower_v, denominator_v, cp_v, drift_v, diffusion_v
+
+
+@njit(cache=True)
+def _adi_step_prepared(U, dt, S, dS, v, dv, r, q, kappa, theta, sigma_v, rho,
+                       lower_boundary, factors, lv, rhs, result, weight=0.5):
+    """Use fixed factors and scratch; finish all input stencils before output."""
+    ns, nv = U.shape
+    n = ns - 2
+    ds2, dv2 = dS * dS, dv * dv
+    half = weight * dt
+    forward = (r - q) * S[1] >= 0.
+    lower_s, denominator_s, cp_s, lower_v, denominator_v, cp_v, drift_v, diffusion_v = factors
+
+    # Original explicit operators, computed one cell at a time.
+    for row in range(n):
+        i = row + 1
+        s2 = S[i] * S[i]
+        drift = (r - q) * S[i]
+        for j in range(nv):
+            ds = ((U[i + 1, j] - U[i, j]) / dS if forward
+                  else (U[i, j] - U[i - 1, j]) / dS)
+            dss = (U[i + 1, j] - 2. * U[i, j] + U[i - 1, j]) / ds2
+            ls = drift * ds + .5 * (v[j] * s2) * dss
+            if j == 0:
+                value_v = drift_v[0] * (U[i, 1] - U[i, 0]) / dv
+            elif j == nv - 1:
+                value_v = drift_v[-1] * (U[i, -1] - U[i, -2]) / dv
+            else:
+                first = (U[i, j + 1] - U[i, j - 1]) / (2. * dv)
+                second = (U[i, j + 1] - 2. * U[i, j] + U[i, j - 1]) / dv2
+                value_v = drift_v[j] * first + diffusion_v[j] * second
+            lv[row, j] = value_v
+            mixed = 0.
+            if 0 < j < nv - 1:
+                cross = (U[i + 1, j + 1] - U[i + 1, j - 1]
+                         - U[i - 1, j + 1] + U[i - 1, j - 1]) / (4. * dS * dv)
+                mixed = rho * sigma_v * (S[i] * v[j]) * cross
+            elif j == nv - 1:
+                ip = 2. * U[i + 1, -1] - U[i + 1, -2]
+                im = 2. * U[i - 1, -1] - U[i - 1, -2]
+                cross = (ip - U[i + 1, -2] - im + U[i - 1, -2]) / (4. * dS * dv)
+                mixed = rho * sigma_v * (S[i] * v[-1]) * cross
+            y0 = U[i, j] + dt * (ls + value_v + mixed - r * U[i, j])
+            rhs[row, j] = y0 - half * ls
+
+    # Forward/back substitution keeps the original divisions and ordering.
+    for row in range(n):
+        for j in range(nv):
+            value = rhs[row, j]
+            if row == 0:
+                value -= lower_s[row, j] * lower_boundary
+            else:
+                value -= lower_s[row, j] * rhs[row - 1, j]
+            rhs[row, j] = value / denominator_s[row, j]
+    for row in range(n - 2, -1, -1):
+        for j in range(nv):
+            rhs[row, j] = rhs[row, j] - cp_s[row, j] * rhs[row + 1, j]
+    for row in range(n):
+        i = row + 1
+        result[i, 0] = (rhs[row, 0] - half * lv[row, 0]) / denominator_v[0]
+        for j in range(1, nv):
+            value = rhs[row, j] - half * lv[row, j]
+            result[i, j] = (value - lower_v[j] * result[i, j - 1]) / denominator_v[j]
+        for j in range(nv - 2, -1, -1):
+            result[i, j] = result[i, j] - cp_v[j] * result[i, j + 1]
+    # Boundary variance solves are independent and overwritten in the original.
+    result[0, :] = lower_boundary
+    result[-1, :] = 2. * result[-2, :] - result[-3, :]
+    return result
+
+
+@njit(cache=True)
+def heston_adi_step(U, dt, S, dS, v, dv, r, q, kappa, theta, sigma_v, rho,
+                    lower_boundary=0.0, implicit_weight=0.5):
+    """Compatible standalone step; leaves input untouched and returns new storage.
+
+    This numerical interface takes scalar q. Product pricers additionally accept
+    cumulative-carry curves and supply a scalar average rate for each substep.
+    """
+    # Preserve the original intermediate casts for non-float64 standalone inputs.
+    if not (U.dtype == np.dtype(np.float64) and S.dtype == np.dtype(np.float64)
+            and v.dtype == np.dtype(np.float64)):
+        return _adi_step_legacy(U, dt, S, dS, v, dv, r, q, kappa, theta,
+                                sigma_v, rho, lower_boundary, implicit_weight)
+    factors = _prepare_adi(dt, S, dS, v, dv, r, q, kappa, theta, sigma_v, implicit_weight)
+    lv = np.empty((len(S) - 2, len(v)))
+    rhs = np.empty_like(lv)
+    result = np.empty(U.shape)
+    return _adi_step_prepared(U, dt, S, dS, v, dv, r, q, kappa, theta, sigma_v,
+                              rho, lower_boundary, factors, lv, rhs, result, implicit_weight)
+
+
+@njit(cache=True)
+def _adi_step_legacy(
     U,
     dt,
     S,
@@ -139,21 +293,11 @@ def heston_adi_step(
     sigma_v,
     rho,
     lower_boundary=0.0,
+    implicit_weight=0.5,
 ):
-    """
-    One time step of the Douglas ADI scheme for the Heston PDE (vectorized).
-
-    U : 2D array (Ns, Nv), current solution.
-    lower_boundary : scalar Dirichlet value at S=0 at the end of this step.
-    Returns updated U.
-
-    Same scheme and boundary treatment as HST_PDE_funcs.heston_adi_step:
-    upwind S-convection (forward when r>q, backward when q>r), central
-    differences in v, explicit mixed-derivative term, product-specific
-    Dirichlet value at S=0, zero gamma (linear extrapolation) at S_max, and
-    linear extrapolation of the mixed term at the top v boundary.
-    """
+    """Retain original dtype-specific intermediates for standalone compatibility."""
     Ns, Nv = U.shape
+    w = float(implicit_weight)
 
     S2 = S * S
     a_convS = (r - q) * S
@@ -201,13 +345,16 @@ def heston_adi_step(
         Li_c = a_convS[1:-1] / dS
         Lp_c = np.zeros(Nint)
     D = 0.5 * v[None, :] * S2[1:-1, None] / (dS * dS)  # (Nint, Nv)
-    a_S = -0.5 * dt * (Lm_c[:, None] + D).T  # (Nv, Nint)
-    b_S = 1.0 - 0.5 * dt * (Li_c[:, None] - 2.0 * D).T
-    c_S = -0.5 * dt * (Lp_c[:, None] + D).T
-    rhs = (Y0[1:-1, :] - 0.5 * dt * L_S_U[1:-1, :]).T
+    a_S = -w * dt * (Lm_c[:, None] + D).T  # (Nv, Nint)
+    b_S = 1.0 - w * dt * (Li_c[:, None] - 2.0 * D).T
+    c_S = -w * dt * (Lp_c[:, None] + D).T
+    rhs = (Y0[1:-1, :] - w * dt * L_S_U[1:-1, :]).T
     # The first interior equation contains a_S[:, 0] * U(S=0).  Move the
     # known Dirichlet value to the right-hand side before solving.
     rhs[:, 0] -= a_S[:, 0] * lower_boundary
+    # Eliminate Y[B] = 2*Y[L] - Y[L-1] from the last interior equation.
+    a_S[:, -1] -= c_S[:, -1]
+    b_S[:, -1] += 2.0 * c_S[:, -1]
     interior = thomas_algorithm_batch(a_S[:, 1:], b_S, c_S[:, :-1], rhs)
     Y1 = np.zeros_like(U)
     Y1[0, :] = lower_boundary
@@ -230,10 +377,10 @@ def heston_adi_step(
     Li_v[1:-1] = -2.0 * diff2
     Lp_v[1:-1] = b_conv_v[1:-1] / (2.0 * dv) + diff2
 
-    a_v = np.broadcast_to(-0.5 * dt * Lm_v[None, :], (Ns, Nv))
-    b_v = np.broadcast_to(1.0 - 0.5 * dt * Li_v[None, :], (Ns, Nv))
-    c_v = np.broadcast_to(-0.5 * dt * Lp_v[None, :], (Ns, Nv))
-    rhs_v = Y1 - 0.5 * dt * L_v_U
+    a_v = np.broadcast_to(-w * dt * Lm_v[None, :], (Ns, Nv))
+    b_v = np.broadcast_to(1.0 - w * dt * Li_v[None, :], (Ns, Nv))
+    c_v = np.broadcast_to(-w * dt * Lp_v[None, :], (Ns, Nv))
+    rhs_v = Y1 - w * dt * L_v_U
     Y2 = thomas_algorithm_batch(a_v[:, 1:], b_v, c_v[:, :-1], rhs_v)
 
     # enforce S boundaries again
@@ -242,10 +389,123 @@ def heston_adi_step(
     return Y2
 
 
-# Later, evaluate at any S with:
-#     S, U_at_v0 = price_xxx_v0curve(...)
-#     f = interp1d(S, U_at_v0, kind='linear', bounds_error=False, fill_value='extrapolate')
-#     price_at_S = float(f(S_any))
+class _ADIRollback:
+    """Own factors and scratch for one valuation; rotate only retired states.
+
+    Exact matrix keys retain at most four factor sets. Every interval computes
+    its rate once for both states, using the root grid endpoints unchanged.
+    """
+
+    def __init__(self, S, dS, v, dv, r, q_input, T, kappa, theta, sigma_v, rho):
+        self.grid = (S, dS, v, dv, r)
+        self.model = (kappa, theta, sigma_v, rho)
+        self.q_input, self.T = q_input, T
+        self.factor_cache = {}
+        self.factor_preparations = self.cache_hits = 0
+        self.lv = np.empty((len(S) - 2, len(v)))
+        self.rhs = np.empty_like(self.lv)
+        self.output = np.empty((len(S), len(v)))
+
+    def _factors(self, h, weight, q_step):
+        """Reuse exact implicit matrices without rounding interval yields."""
+        key = (weight * h, q_step)
+        if key in self.factor_cache:
+            factors = self.factor_cache.pop(key)
+            self.cache_hits += 1
+        else:
+            if len(self.factor_cache) == 4:
+                self.factor_cache.pop(next(iter(self.factor_cache)))
+            factors = _prepare_adi(h, *self.grid, q_step, *self.model[:3], weight)
+            self.factor_preparations += 1
+        self.factor_cache[key] = factors
+        return factors
+
+    def advance(self, states, dt, tau_start, tau_end, lower_terminal,
+                *, weight=0.5, substeps=1):
+        """Advance privately owned states with the original subinterval arithmetic.
+
+        A returned state takes the spare buffer; its retired input becomes the
+        next spare. All input stencils finish before any output is written.
+        """
+        h = dt / substeps
+        result = list(states)
+        for i in range(substeps):
+            start = tau_start + i * h
+            end = tau_end if i == substeps - 1 else start + h
+            q_step = dividend_rate_for_tau_step(self.q_input, self.T, start, end)
+            boundary = lower_terminal * np.exp(-self.grid[-1] * end)
+            factors = self._factors(h, weight, q_step)
+            for j, U in enumerate(result):
+                result[j] = _adi_step_prepared(
+                    U, h, *self.grid, q_step, *self.model, boundary,
+                    factors, self.lv, self.rhs, self.output, weight)
+                self.output = U
+        return result
+
+
+def _integer_trading_days(values, label):
+    """Canonicalize integer-aligned day offsets with absolute tolerance 1e-8."""
+    values = np.asarray(values, dtype=float)
+    rounded = np.rint(values)
+    if (np.any(~np.isfinite(values)) or np.any(values < 0)
+            or np.any(np.abs(values - rounded) > 1e-8)
+            or np.any(rounded >= np.iinfo(np.int64).max)):
+        raise ValueError(f"{label} must be finite, nonnegative whole trading days (tolerance 1e-8 days)")
+    return rounded.astype(np.int64)
+
+
+def _trading_schedule(T, obs_times, steps_per_day, *, obs_in_years=False):
+    """One regular grid; stable first-row duplicates retain aligned metadata.
+
+    Days beyond maturity are filtered after integer canonicalization. Markers
+    include maturity at zero and valuation at N*m; no dates add extra nodes.
+    """
+    if (isinstance(steps_per_day, (bool, np.bool_))
+            or not isinstance(steps_per_day, (int, np.integer)) or steps_per_day <= 0):
+        raise ValueError("steps_per_day must be a positive integer")
+    N = int(_integer_trading_days(float(T) * 252, "T in years (252*T trading days)"))
+    observations = np.atleast_1d(np.asarray(obs_times, dtype=float))
+    if observations.ndim != 1:
+        raise ValueError("obs_times must be a one-dimensional observation schedule")
+    units = "obs_times in years (252*obs_times trading days)" if obs_in_years else "obs_times in trading days"
+    days = _integer_trading_days(observations * (252 if obs_in_years else 1), units)
+    order = np.argsort(days, kind="stable")
+    order = order[days[order] <= N]
+    if order.size == 0:
+        raise ValueError("obs_times has no supported observations within maturity")
+    order = order[np.r_[True, np.diff(days[order]) != 0]]
+    days = days[order]
+    events = {(N - int(day)) * int(steps_per_day): i for i, day in enumerate(days)}
+    times = np.arange(N * int(steps_per_day) + 1, dtype=np.int64) / (252 * steps_per_day)
+    return N, days, order, events, times
+
+
+def _event_values(values, count, label):
+    """Broadcast a scalar or retain one metadata value per original event row."""
+    values = np.asarray(values, dtype=float)
+    if values.ndim == 0:
+        return np.full(count, float(values))
+    if values.ndim != 1 or values.size != count:
+        raise ValueError(f"{label} must have one value per obs_times row")
+    return values
+
+
+def _pricing_grid(S0, v0, theta, knock_out, Ns, Nv, S_max, v_max):
+    """Build automatic or explicit domains containing the evaluation point."""
+    S_max = max(3.0 * S0, 2.0 * float(np.max(knock_out))) if S_max is None else float(S_max)
+    v_max = max(0.5, 4 * theta, 4 * v0) if v_max is None else float(v_max)
+    if not (np.isfinite(S_max) and np.isfinite(v_max) and S_max > 0 and v_max > 0
+            and 0 <= S0 <= S_max and 0 <= v0 <= v_max):
+        raise ValueError("Domains must be positive, finite and contain S0 and v0")
+    S = np.linspace(0, S_max, Ns)
+    v = np.linspace(0, v_max, Nv)
+    return S, S[1] - S[0], v, v[1] - v[0]
+
+
+def _initial_value(U, S, v, S0, v0):
+    """Interpolate one scalar price, rejecting points outside the physical grid."""
+    interp = RegularGridInterpolator((S, v), U, bounds_error=True, fill_value=None)
+    return float(interp((S0, v0)))
 
 
 def price_snowball_heston(
@@ -264,145 +524,126 @@ def price_snowball_heston(
     v0,
     Ns=80,
     Nv=40,
-    Nt_uniform=200,
+    *,
     daily_ki=True,
+    historical_KI=False,
     SPD=0.0,
     pay_times=None,
     mg=0.0,
     mg_ist=None,
     K=None,
     q_maturities=None,
+    steps_per_day=1,
+    S_max=None,
+    v_max=None,
+    return_surface=False,
+    rannacher_steps=2,
 ):
-    """Snowball price; q may be scalar, a curve, or an array with q_maturities."""
+    """Snowball scalar net payoff price.
+
+    T is years; obs_times are whole trading days. Explicit pay_times supply
+    inception-relative accrual-day counts for the caller's 30/360 convention.
+    Without pay_times, obs_days/252 is a compatibility fallback, not a
+    date-based 30/360 calculation. Accrual ends at the last observation.
+    steps_per_day subdivides the 252-day PDE grid without
+    adding observations. Daily KI includes pre-observation valuation.
+    K defaults to S0; q accepts a scalar, curve, or array with q_maturities.
+    historical_KI selects the already-knocked-in state at valuation.
+    rannacher_steps backward-Euler half-steps are taken after the terminal
+    payoff and after every observed event (0 restores plain Crank-Nicolson).
+    return_surface returns (S, v, U) of the priced state instead of the scalar.
+    Options after Ns/Nv are keyword-only. Explicit domains reject extrapolation."""
+    rannacher_steps = int(rannacher_steps)
+    if rannacher_steps < 0:
+        raise ValueError("rannacher_steps must be a non-negative integer")
     q_input = prepare_dividend_input(q, q_maturities)
-    obs_yr = np.asarray(obs_times, dtype=float) / 252.0
-    if pay_times is None:
-        pay_yr = obs_yr.copy()
-    else:
-        pay_yr = np.asarray(pay_times, dtype=float) / 360.0
+    count = np.size(obs_times)
+    N, obs_days, order, events, tau_points = _trading_schedule(
+        T, obs_times, steps_per_day, obs_in_years=False)
+    T = N / 252.0
+    dt = 1.0 / (252 * steps_per_day)
+    coupon = _event_values(coupon, count, "coupon")[order]
+    knock_out = _event_values(knock_out, count, "knock_out")[order]
+    pay_yr = (obs_days / 252.0 if pay_times is None else
+              _event_values(pay_times, count, "pay_times")[order] / 360.0)
     if mg_ist is None:
         mg_ist = r
     mgi = mg * mg_ist
     if K is None:
         K = S0
 
-    order = np.argsort(obs_yr)
-    obs_yr = obs_yr[order]
-    pay_yr = pay_yr[order]
-    knock_out = np.asarray(knock_out, dtype=float)
-    coupon = np.asarray(coupon, dtype=float)
-    if knock_out.ndim == 0:
-        knock_out = np.full(obs_yr.size, float(knock_out))
-    if coupon.ndim == 0:
-        coupon = np.full(obs_yr.size, float(coupon))
-    knock_out = knock_out[order]
-    coupon = coupon[order]
-    if not (knock_out.size == coupon.size == obs_yr.size == pay_yr.size):
-        raise ValueError(
-            "coupon, knock_out, obs_times and pay_times must all have the same length"
-        )
-
-    keep = obs_yr <= T
-    obs_yr = obs_yr[keep]
-    pay_yr = pay_yr[keep]
-    knock_out = knock_out[keep]
-    coupon = coupon[keep]
-    _, uniq = np.unique(obs_yr, return_index=True)
-    obs_yr = obs_yr[uniq]
-    pay_yr = pay_yr[uniq]
-    knock_out = knock_out[uniq]
-    coupon = coupon[uniq]
-
     period_len = np.diff(np.concatenate(([0.0], pay_yr)))
     acc_coupon = np.cumsum(coupon * period_len)
-    stub = coupon[-1] * max(T - pay_yr[-1], 0.0)
-    full_coupon = acc_coupon[-1] + stub
-    # maturity margin over the full coupon horizon (from issue), like the coupon
-    full_pay = max(pay_yr[-1], T)
+    full_coupon = acc_coupon[-1]
+    # Contractual accrual ends at the final observation, independently of PDE T.
+    full_pay = pay_yr[-1]
 
-    S_max = max(S0 * 3.0, 2.0 * float(np.max(knock_out)))
-    v_max = max(0.5, 4 * theta, 4 * v0)
-    S = np.linspace(0, S_max, Ns)
-    dS = S[1] - S[0]
-    v = np.linspace(0, v_max, Nv)
-    dv = v[1] - v[0]
-
-    tau_obs = T - obs_yr
-    tau_uniform = np.linspace(0, T, Nt_uniform)
-    tau_points = np.unique(np.sort(np.concatenate(([0, T], tau_obs, tau_uniform))))
-    tau_points = tau_points[tau_points >= 0]
+    S, dS, v, dv = _pricing_grid(S0, v0, theta, knock_out, Ns, Nv, S_max, v_max)
 
     payoff_in = np.where(S >= K, 1.0, np.maximum(S / K, SPD))
     U_in = np.tile((payoff_in - 1.0)[:, None], (1, Nv)) - mgi * full_pay
-    if daily_ki:
+    if historical_KI:
+        U_noin = None
+    elif daily_ki:
         U_noin = np.full((Ns, Nv), full_coupon - mgi * full_pay)
     else:
         payoff_noin = np.where(S <= H_in, payoff_in - 1.0, full_coupon) - mgi * full_pay
         U_noin = np.tile(payoff_noin[:, None], (1, Nv))
 
+    terminal_idx = events.get(0)
+    if terminal_idx is not None:
+        # Maturity KO uses the aligned contractual redemption in both states.
+        redemption = acc_coupon[terminal_idx] - mgi * pay_yr[terminal_idx]
+        mask_out = S >= knock_out[terminal_idx]
+        if U_noin is not None:
+            U_noin[mask_out, :] = redemption
+        U_in[mask_out, :] = redemption
+
+    if daily_ki and not historical_KI:
+        # Maturity itself is a knock-in observation, including at T=0.
+        U_noin[S <= H_in, :] = U_in[S <= H_in, :]
+
     # At S=0 the underlying cannot recover or knock out.  Both state values
     # therefore equal the knocked-in terminal loss, discounted while stepping
     # backward.  Initialize the no-in boundary as well for the first PDE step.
     lower_terminal = float(U_in[0, 0])
-    U_noin[0, :] = lower_terminal
+    if U_noin is not None:
+        U_noin[0, :] = lower_terminal
 
-    for k in range(len(tau_points) - 1):
-        dt = tau_points[k + 1] - tau_points[k]
-        if dt <= 0:
-            continue
-        q_step = dividend_rate_for_tau_step(
-            q_input, T, tau_points[k], tau_points[k + 1]
+    rollback = _ADIRollback(S, dS, v, dv, r, q_input, T, kappa, theta, sigma_v, rho)
+    for step in range(1, len(tau_points)):
+        # Terminal payoff (first step) and every observed event inject grid-scale
+        # content; follow them with Rannacher backward-Euler half-steps.
+        rannacher = rannacher_steps > 0 and (step == 1 or (step - 1) in events)
+        active = [] if historical_KI else [U_noin]
+        if daily_ki or historical_KI:
+            active.append(U_in)
+        active = rollback.advance(
+            active, dt, tau_points[step - 1], tau_points[step], lower_terminal,
+            weight=1.0 if rannacher else 0.5,
+            substeps=rannacher_steps if rannacher else 1,
         )
-        lower_boundary = lower_terminal * np.exp(-r * tau_points[k + 1])
-        U_noin = heston_adi_step(
-            U_noin,
-            dt,
-            S,
-            dS,
-            v,
-            dv,
-            r,
-            q_step,
-            kappa,
-            theta,
-            sigma_v,
-            rho,
-            lower_boundary,
-        )
-        if daily_ki:
-            U_in = heston_adi_step(
-                U_in,
-                dt,
-                S,
-                dS,
-                v,
-                dv,
-                r,
-                q_step,
-                kappa,
-                theta,
-                sigma_v,
-                rho,
-                lower_boundary,
-            )
-            mask_in = S <= H_in
-            U_noin[mask_in, :] = U_in[mask_in, :]
-        tau_now = tau_points[k + 1]
-        hits = np.where(np.abs(tau_obs - tau_now) < 1e-12)[0]
-        if hits.size > 0:
-            idx = int(hits[0])
+        if not historical_KI:
+            U_noin = active[0]
+        if daily_ki or historical_KI:
+            U_in = active[-1]
+            if daily_ki and not historical_KI and step % steps_per_day == 0:
+                # Numerical substeps do not add contractual daily KI observations.
+                mask_in = S <= H_in
+                U_noin[mask_in, :] = U_in[mask_in, :]
+        idx = events.get(step)
+        if idx is not None:
             redemption = acc_coupon[idx] - mgi * pay_yr[idx]
             mask_out = S >= knock_out[idx]
-            U_noin[mask_out, :] = redemption
-            if daily_ki:
+            if U_noin is not None:
+                U_noin[mask_out, :] = redemption
+            if daily_ki or historical_KI:
                 U_in[mask_out, :] = redemption
 
-        # ---------- interpolate initial value ----------
-    interp = RegularGridInterpolator(
-        (S, v), U_noin, bounds_error=False, fill_value=None
-    )
-    price = float(interp((S0, v0)))
-    return price
+    value = U_in if historical_KI else U_noin
+    if return_surface:
+        return S, v, value
+    return _initial_value(value, S, v, S0, v0)
 
 
 def price_phoenix_heston(
@@ -421,55 +662,52 @@ def price_phoenix_heston(
     v0,
     Ns=80,
     Nv=40,
-    Nt_uniform=200,
+    *,
     H_coupon=None,
     daily_ki=True,
+    historical_KI=False,
     SPD=0.0,
     mg=0.0,
     mg_ist=None,
     full_term=None,
     K=None,
     q_maturities=None,
+    steps_per_day=1,
+    S_max=None,
+    v_max=None,
+    return_surface=False,
+    rannacher_steps=2,
 ):
-    """Return the scalar net-to-client Phoenix price.
-    obs_times in years (absolute coupons, like the original). Pass full_term (the
-    trade's total term from issue) to charge the maturity margin over the full term.
-    K: strike of the knocked-in put (initial level at issue for a seasoned trade);
-    if None, uses S0 (fresh-trade case).
-    q may be scalar, a curve, or an array with q_maturities."""
+    """Phoenix scalar net payoff price with absolute observation coupons.
+
+    T and obs_times are years aligned to whole 252-trading-day offsets.
+    steps_per_day adds PDE substeps without extra observations; daily KI
+    includes pre-observation valuation. full_term is the margin horizon from
+    issue; K is the issue strike, defaulting to S0 for a fresh trade.
+    historical_KI selects the already-knocked-in state at valuation.
+    rannacher_steps backward-Euler half-steps are taken after the terminal
+    payoff and after every observed event (0 restores plain Crank-Nicolson).
+    return_surface returns (S, v, U) of the priced state instead of the scalar.
+    q accepts a scalar, curve, or array with q_maturities. Options after Ns/Nv
+    are keyword-only. Explicit domains reject extrapolation."""
+    rannacher_steps = int(rannacher_steps)
+    if rannacher_steps < 0:
+        raise ValueError("rannacher_steps must be a non-negative integer")
     q_input = prepare_dividend_input(q, q_maturities)
-    obs_times = np.asarray(obs_times, dtype=float)
-    order = np.argsort(obs_times)
-    obs_times = obs_times[order]
+    count = np.size(obs_times)
+    N, obs_days, order, events, tau_points = _trading_schedule(
+        T, obs_times, steps_per_day, obs_in_years=True)
+    T = N / 252.0
+    dt = 1.0 / (252 * steps_per_day)
+    coupon = _event_values(coupon, count, "coupon")[order]
+    knock_out = _event_values(knock_out, count, "knock_out")[order]
+    obs_times = obs_days / 252.0
     if mg_ist is None:
         mg_ist = r
     mgi = mg * mg_ist
     if K is None:
         K = S0
 
-    knock_out = np.asarray(knock_out, dtype=float)
-    coupon = np.asarray(coupon, dtype=float)
-    if knock_out.ndim == 0:
-        knock_out = np.full(obs_times.size, float(knock_out))
-    if coupon.ndim == 0:
-        coupon = np.full(obs_times.size, float(coupon))
-    knock_out = knock_out[order]
-    coupon = coupon[order]
-    if not (knock_out.size == coupon.size == obs_times.size):
-        raise ValueError(
-            "coupon, knock_out and obs_times must all have the same length"
-        )
-
-    keep = obs_times <= T
-    obs_times = obs_times[keep]
-    knock_out = knock_out[keep]
-    coupon = coupon[keep]
-    _, uniq = np.unique(obs_times, return_index=True)
-    obs_times = obs_times[uniq]
-    knock_out = knock_out[uniq]
-    coupon = coupon[uniq]
-    if obs_times.size == 0:
-        raise ValueError("obs_times contains no dates within [0, T]")
     if H_coupon is None:
         H_coupon = H_in
 
@@ -479,98 +717,76 @@ def price_phoenix_heston(
         full_term = obs_times[-1]
     full_pay = max(full_term, T)
 
-    S_max = max(S0 * 3.0, 2.0 * float(np.max(knock_out)))
-    v_max = max(0.5, 4 * theta, 4 * v0)
-    S = np.linspace(0, S_max, Ns)
-    dS = S[1] - S[0]
-    v = np.linspace(0, v_max, Nv)
-    dv = v[1] - v[0]
-
-    tau_obs = T - obs_times
-    tau_uniform = np.linspace(0, T, Nt_uniform)
-    tau_points = np.unique(np.sort(np.concatenate(([0, T], tau_obs, tau_uniform))))
-    tau_points = tau_points[tau_points >= 0]
+    S, dS, v, dv = _pricing_grid(S0, v0, theta, knock_out, Ns, Nv, S_max, v_max)
 
     payoff_in = np.where(S >= K, 1.0, np.maximum(S / K, SPD))
     U_in = np.tile((payoff_in - 1.0)[:, None], (1, Nv)) - mgi * full_pay
-    if daily_ki:
+    if historical_KI:
+        U_noin = None
+    elif daily_ki:
         U_noin = np.full((Ns, Nv), -mgi * full_pay)
     else:
         payoff_noin = np.where(S <= H_in, payoff_in - 1.0, 0.0) - mgi * full_pay
         U_noin = np.tile(payoff_noin[:, None], (1, Nv))
 
-    if np.isclose(obs_times[-1], T):
-        coupon_last = float(coupon[-1])
+    terminal_idx = events.get(0)
+    if terminal_idx is not None:
+        coupon_last = float(coupon[terminal_idx])
         mask_c = S >= H_coupon
-        U_noin[mask_c, :] += coupon_last
+        if U_noin is not None:
+            U_noin[mask_c, :] += coupon_last
         U_in[mask_c, :] += coupon_last
-        mask_out = S >= knock_out[-1]
-        U_noin[mask_out, :] = coupon_last - mgi * full_pay
+        mask_out = S >= knock_out[terminal_idx]
+        if U_noin is not None:
+            U_noin[mask_out, :] = coupon_last - mgi * full_pay
         U_in[mask_out, :] = coupon_last - mgi * full_pay
+
+    if daily_ki and not historical_KI:
+        # Observe terminal knock-in after maturity coupon/knock-out events.
+        U_noin[S <= H_in, :] = U_in[S <= H_in, :]
 
     # At S=0 the underlying cannot reach either the coupon or knock-out
     # barrier.  Both state values reduce to the knocked-in terminal loss.
     lower_terminal = float(U_in[0, 0])
-    U_noin[0, :] = lower_terminal
+    if U_noin is not None:
+        U_noin[0, :] = lower_terminal
 
-    for k in range(len(tau_points) - 1):
-        dt = tau_points[k + 1] - tau_points[k]
-        if dt <= 0:
-            continue
-        q_step = dividend_rate_for_tau_step(
-            q_input, T, tau_points[k], tau_points[k + 1]
+    rollback = _ADIRollback(S, dS, v, dv, r, q_input, T, kappa, theta, sigma_v, rho)
+    for step in range(1, len(tau_points)):
+        # Terminal payoff (first step) and every observed event inject grid-scale
+        # content; follow them with Rannacher backward-Euler half-steps.
+        rannacher = rannacher_steps > 0 and (step == 1 or (step - 1) in events)
+        active = [] if historical_KI else [U_noin]
+        if daily_ki or historical_KI:
+            active.append(U_in)
+        active = rollback.advance(
+            active, dt, tau_points[step - 1], tau_points[step], lower_terminal,
+            weight=1.0 if rannacher else 0.5,
+            substeps=rannacher_steps if rannacher else 1,
         )
-        lower_boundary = lower_terminal * np.exp(-r * tau_points[k + 1])
-        U_noin = heston_adi_step(
-            U_noin,
-            dt,
-            S,
-            dS,
-            v,
-            dv,
-            r,
-            q_step,
-            kappa,
-            theta,
-            sigma_v,
-            rho,
-            lower_boundary,
-        )
-        if daily_ki:
-            U_in = heston_adi_step(
-                U_in,
-                dt,
-                S,
-                dS,
-                v,
-                dv,
-                r,
-                q_step,
-                kappa,
-                theta,
-                sigma_v,
-                rho,
-                lower_boundary,
-            )
-            mask_in = S <= H_in
-            U_noin[mask_in, :] = U_in[mask_in, :]
-        tau_now = tau_points[k + 1]
-        hits = np.where(np.abs(tau_obs - tau_now) < 1e-12)[0]
-        if hits.size > 0:
-            idx = int(hits[0])
+        if not historical_KI:
+            U_noin = active[0]
+        if daily_ki or historical_KI:
+            U_in = active[-1]
+            if daily_ki and not historical_KI and step % steps_per_day == 0:
+                # Numerical substeps do not add contractual daily KI observations.
+                mask_in = S <= H_in
+                U_noin[mask_in, :] = U_in[mask_in, :]
+        idx = events.get(step)
+        if idx is not None:
             mask_c = S >= H_coupon
-            U_noin[mask_c, :] += coupon[idx]
+            if U_noin is not None:
+                U_noin[mask_c, :] += coupon[idx]
             U_in[mask_c, :] += coupon[idx]
             mask_out = S >= knock_out[idx]
-            U_noin[mask_out, :] = coupon[idx] - mgi * obs_times[idx]
+            if U_noin is not None:
+                U_noin[mask_out, :] = coupon[idx] - mgi * obs_times[idx]
             U_in[mask_out, :] = coupon[idx] - mgi * obs_times[idx]
 
-    # ---------- interpolate initial value ----------
-    interp = RegularGridInterpolator(
-        (S, v), U_noin, bounds_error=False, fill_value=None
-    )
-    price = float(interp((S0, v0)))
-    return price
+    value = U_in if historical_KI else U_noin
+    if return_surface:
+        return S, v, value
+    return _initial_value(value, S, v, S0, v0)
 
 
 def price_autocallable_heston(
@@ -589,196 +805,150 @@ def price_autocallable_heston(
     v0,
     Ns=80,
     Nv=40,
-    Nt_uniform=200,
+    *,
     pay_times=None,
     mg=0.0,
     mg_ist=None,
     q_maturities=None,
+    steps_per_day=1,
+    S_max=None,
+    v_max=None,
+    return_surface=False,
+    rannacher_steps=2,
 ):
-    """Autocallable (小雪球), but returns (S, U(S, v0)) instead of the scalar net price."""
+    """Autocallable scalar net payoff price.
+
+    T is years; obs_times are whole trading days. Explicit pay_times supply
+    inception-relative accrual-day counts for the caller's 30/360 convention.
+    Without pay_times, obs_days/252 is a compatibility fallback, not a
+    date-based 30/360 calculation. Accrual ends at the last observation.
+    steps_per_day adds PDE substeps without extra events.
+    rannacher_steps backward-Euler half-steps are taken after the terminal
+    payoff and after every observed event (0 restores plain Crank-Nicolson).
+    return_surface returns (S, v, U) instead of the scalar.
+    q accepts a scalar, curve, or array with q_maturities. Options after Ns/Nv
+    are keyword-only. Explicit domains reject extrapolation."""
+    rannacher_steps = int(rannacher_steps)
+    if rannacher_steps < 0:
+        raise ValueError("rannacher_steps must be a non-negative integer")
     q_input = prepare_dividend_input(q, q_maturities)
-    obs_yr = np.asarray(obs_times, dtype=float) / 252.0
-    if pay_times is None:
-        pay_yr = obs_yr.copy()
-    else:
-        pay_yr = np.asarray(pay_times, dtype=float) / 360.0
+    count = np.size(obs_times)
+    N, obs_days, order, events, tau_points = _trading_schedule(
+        T, obs_times, steps_per_day, obs_in_years=False)
+    T = N / 252.0
+    dt = 1.0 / (252 * steps_per_day)
+    coupon = _event_values(coupon, count, "coupon")[order]
+    knock_out = _event_values(knock_out, count, "knock_out")[order]
+    pay_yr = (obs_days / 252.0 if pay_times is None else
+              _event_values(pay_times, count, "pay_times")[order] / 360.0)
     if mg_ist is None:
         mg_ist = r
     mgi = mg * mg_ist
 
-    order = np.argsort(obs_yr)
-    obs_yr = obs_yr[order]
-    pay_yr = pay_yr[order]
-    knock_out = np.asarray(knock_out, dtype=float)
-    coupon = np.asarray(coupon, dtype=float)
-    if knock_out.ndim == 0:
-        knock_out = np.full(obs_yr.size, float(knock_out))
-    if coupon.ndim == 0:
-        coupon = np.full(obs_yr.size, float(coupon))
-    knock_out = knock_out[order]
-    coupon = coupon[order]
-    if not (knock_out.size == coupon.size == obs_yr.size == pay_yr.size):
-        raise ValueError(
-            "coupon, knock_out, obs_times and pay_times must all have the same length"
-        )
-
-    keep = obs_yr <= T
-    obs_yr = obs_yr[keep]
-    pay_yr = pay_yr[keep]
-    knock_out = knock_out[keep]
-    coupon = coupon[keep]
-    _, uniq = np.unique(obs_yr, return_index=True)
-    obs_yr = obs_yr[uniq]
-    pay_yr = pay_yr[uniq]
-    knock_out = knock_out[uniq]
-    coupon = coupon[uniq]
-    if obs_yr.size == 0:
-        raise ValueError("obs_times contains no dates within [0, T]")
-
     period_len = np.diff(np.concatenate(([0.0], pay_yr)))
     acc_coupon = np.cumsum(coupon * period_len)
-    stub = coupon[-1] * max(T - pay_yr[-1], 0.0)
-    full_coupon = acc_coupon[-1] + stub
-    # maturity premium/margin over the full coupon horizon (from issue), like the coupon
-    full_pay = max(pay_yr[-1], T)
+    full_coupon = acc_coupon[-1]
+    # Premium and margin share the final observation's contractual horizon.
+    full_pay = pay_yr[-1]
 
-    S_max = max(S0 * 3.0, 2.0 * float(np.max(knock_out)))
-    v_max = max(0.5, 4 * theta, 4 * v0)
-    S = np.linspace(0, S_max, Ns)
-    dS = S[1] - S[0]
-    v = np.linspace(0, v_max, Nv)
-    dv = v[1] - v[0]
-
-    tau_obs = T - obs_yr
-    tau_uniform = np.linspace(0, T, Nt_uniform)
-    tau_points = np.unique(np.sort(np.concatenate(([0, T], tau_obs, tau_uniform))))
-    tau_points = tau_points[tau_points >= 0]
+    S, dS, v, dv = _pricing_grid(S0, v0, theta, knock_out, Ns, Nv, S_max, v_max)
 
     U = np.full((Ns, Nv), -premium * full_pay - mgi * full_pay)
-    if np.isclose(obs_yr[-1], T):
-        mask_out = S >= knock_out[-1]
+    terminal_idx = events.get(0)
+    if terminal_idx is not None:
+        mask_out = S >= knock_out[terminal_idx]
         U[mask_out, :] = full_coupon - premium * full_pay - mgi * full_pay
 
     lower_terminal = float(U[0, 0])
 
-    for k in range(len(tau_points) - 1):
-        dt = tau_points[k + 1] - tau_points[k]
-        if dt <= 0:
-            continue
-        q_step = dividend_rate_for_tau_step(
-            q_input, T, tau_points[k], tau_points[k + 1]
+    rollback = _ADIRollback(S, dS, v, dv, r, q_input, T, kappa, theta, sigma_v, rho)
+    for step in range(1, len(tau_points)):
+        # Terminal payoff (first step) and every observed event inject grid-scale
+        # content; follow them with Rannacher backward-Euler half-steps.
+        rannacher = rannacher_steps > 0 and (step == 1 or (step - 1) in events)
+        (U,) = rollback.advance(
+            [U], dt, tau_points[step - 1], tau_points[step], lower_terminal,
+            weight=1.0 if rannacher else 0.5,
+            substeps=rannacher_steps if rannacher else 1,
         )
-        lower_boundary = lower_terminal * np.exp(-r * tau_points[k + 1])
-        U = heston_adi_step(
-            U,
-            dt,
-            S,
-            dS,
-            v,
-            dv,
-            r,
-            q_step,
-            kappa,
-            theta,
-            sigma_v,
-            rho,
-            lower_boundary,
-        )
-        tau_now = tau_points[k + 1]
-        hits = np.where(np.abs(tau_obs - tau_now) < 1e-12)[0]
-        if hits.size > 0:
-            idx = int(hits[0])
+        idx = events.get(step)
+        if idx is not None:
             redemption = acc_coupon[idx] - premium * pay_yr[idx] - mgi * pay_yr[idx]
             mask_out = S >= knock_out[idx]
             U[mask_out, :] = redemption
 
-    # ---------- interpolate initial value ----------
-    interp = RegularGridInterpolator((S, v), U, bounds_error=False, fill_value=None)
-    price = float(interp((S0, v0)))
-    return price
+    if return_surface:
+        return S, v, U
+    return _initial_value(U, S, v, S0, v0)
 
 
-def calculate_greeks(pricing_function, parameters, spot_bump=None, variance_bump=None):
-    """Calculate delta, gamma, and Heston vega by central finite differences.
+def _stencil_bounds(S, S0):
+    """Interior node and cell weight used at S0, plus the spot stencil bounds."""
+    dS = float(S[1] - S[0])
+    i = int(np.clip(np.searchsorted(S, S0, side="right") - 1, 1, len(S) - 3))
+    weight = (S0 - S[i]) / dS
+    lo, hi = i - 1, i + 2
+    if abs(weight) < 1e-12:
+        hi = i + 1
+    elif abs(weight - 1.0) < 1e-12:
+        lo = i
+    return i, float(weight), lo, hi
 
-    Parameters
-    ----------
-    pricing_function : callable
-        Any scalar pricing function that accepts its inputs as keyword
-        arguments, including ``heston_call_price``,
-        ``price_snowball_heston``, ``price_phoenix_heston``, and
-        ``price_autocallable_heston``.
-    parameters : mapping
-        All keyword arguments required by ``pricing_function``.  It must
-        contain ``S0`` (spot) and ``v0`` (initial Heston variance).  The input
-        mapping is not modified.
-    spot_bump : float, optional
-        Absolute spot bump.  The default is 1% of ``S0``.
-    variance_bump : float, optional
-        Absolute ``v0`` bump.  The default is 1% of ``v0`` (with a floor of
-        1e-6).  Vega is therefore d(price)/d(v0), matching the project's
-        existing Heston-grid convention.
 
-    Returns
-    -------
-    dict
-        ``{"delta": ..., "gamma": ..., "vega": ...}``, in price units.
+def node_greeks(S, v, U, S0, v0):
+    """Delta, gamma and variance vega from central node differences.
+
+    Derivatives are taken at the four nodes of the cell containing (S0, v0) and
+    averaged with that cell's bilinear weights, the same definition as the
+    production grid_greeks. dV/dv0 is unscaled; multiply by 0.02*sqrt(v0) for a
+    per-volatility-point vega.
+    """
+    dS, dv = float(S[1] - S[0]), float(v[1] - v[0])
+    if not (S[1] <= S0 < S[-3] and v[1] <= v0 < v[-3]):
+        raise ValueError("evaluation point must lie inside the differentiable grid interior")
+    i = int(np.clip(np.searchsorted(S, S0, side="right") - 1, 1, len(S) - 3))
+    j = int(np.clip(np.searchsorted(v, v0, side="right") - 1, 1, len(v) - 3))
+    wS, wv = (S0 - S[i]) / dS, (v0 - v[j]) / dv
+    delta = gamma = variance_vega = 0.0
+    for ii, wi in ((i, 1.0 - wS), (i + 1, wS)):
+        for jj, wj in ((j, 1.0 - wv), (j + 1, wv)):
+            w = wi * wj
+            delta += w * (U[ii + 1, jj] - U[ii - 1, jj]) / (2.0 * dS)
+            gamma += w * (U[ii + 1, jj] - 2.0 * U[ii, jj] + U[ii - 1, jj]) / (dS * dS)
+            variance_vega += w * (U[ii, jj + 1] - U[ii, jj - 1]) / (2.0 * dv)
+    return float(delta), float(gamma), float(variance_vega)
+
+
+def calculate_greeks(pricing_function, parameters):
+    """Node Greeks from one PDE solve; no bump and no moving domain.
+
+    parameters must supply S0/v0 and every pricing input; it is not modified.
+    delta = dV/dS, gamma = d2V/dS2, vega = dV/dv0 (variance vega) and
+    vol_vega = vega*0.02*sqrt(v0) per volatility point, all per unit notional.
+    stencil_crosses_barrier flags an evaluation stencil that straddles the
+    knock-out or knock-in level, where gamma is a discrete event derivative
+    rather than a smooth surface derivative.
     """
     if not callable(pricing_function):
         raise TypeError("pricing_function must be callable")
-
     base = dict(parameters)
-    missing = {"S0", "v0"}.difference(base)
-    if missing:
-        raise KeyError(f"parameters is missing: {', '.join(sorted(missing))}")
+    for name in ("S0", "v0"):
+        if name not in base:
+            raise KeyError(f"parameters is missing: {name}")
+        if float(base[name]) <= 0.0:
+            raise ValueError(f"{name} must be positive")
 
-    spot = float(base["S0"])
-    variance = float(base["v0"])
-    if spot <= 0.0:
-        raise ValueError("S0 must be positive")
-    if variance <= 0.0:
-        raise ValueError("v0 must be positive")
-
-    d_spot = abs(float(spot_bump)) if spot_bump is not None else 0.01 * spot
-    d_variance = (
-        abs(float(variance_bump))
-        if variance_bump is not None
-        else max(0.01 * variance, 1e-6)
-    )
-    if d_spot == 0.0 or d_spot >= spot:
-        raise ValueError("spot_bump must satisfy 0 < abs(spot_bump) < S0")
-    if d_variance == 0.0 or d_variance >= variance:
-        raise ValueError("variance_bump must satisfy 0 < abs(variance_bump) < v0")
-
-    spot_up = base.copy()
-    spot_up["S0"] = spot + d_spot
-    spot_down = base.copy()
-    spot_down["S0"] = spot - d_spot
-    variance_up = base.copy()
-    variance_up["v0"] = variance + d_variance
-    variance_down = base.copy()
-    variance_down["v0"] = variance - d_variance
-
-    values = (
-        pricing_function(**base),
-        pricing_function(**spot_up),
-        pricing_function(**spot_down),
-        pricing_function(**variance_up),
-        pricing_function(**variance_down),
-    )
-    try:
-        (
-            price,
-            price_spot_up,
-            price_spot_down,
-            price_variance_up,
-            price_variance_down,
-        ) = map(float, values)
-    except (TypeError, ValueError) as exc:
-        raise TypeError("pricing_function must return one scalar price") from exc
-
+    spot, variance = float(base["S0"]), float(base["v0"])
+    S, v, U = pricing_function(**base, return_surface=True)
+    delta, gamma, variance_vega = node_greeks(S, v, U, spot, variance)
+    _, _, lo, hi = _stencil_bounds(S, spot)
+    barrier_values = [np.asarray(base[name], dtype=float).ravel()
+                      for name in ("knock_out", "H_in") if name in base]
+    crosses = any(np.any((level >= S[lo]) & (level <= S[hi])) for level in barrier_values)
     return {
-        "delta": (price_spot_up - price_spot_down) / (2.0 * d_spot),
-        "gamma": (price_spot_up - 2.0 * price + price_spot_down) / d_spot**2,
-        "vega": (price_variance_up - price_variance_down) / (2.0 * d_variance),
+        "delta": delta,
+        "gamma": gamma,
+        "vega": variance_vega,
+        "vol_vega": variance_vega * 0.02 * np.sqrt(variance),
+        "stencil_crosses_barrier": bool(crosses),
     }

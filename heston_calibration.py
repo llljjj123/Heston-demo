@@ -9,12 +9,12 @@ regularizer and as a differential-evolution warm start.
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
-from scipy.integrate import fixed_quad
 from scipy.optimize import differential_evolution, minimize
-from scipy.stats import norm
+from scipy.special import log_ndtr, roots_legendre
 
 try:
     from numba import njit
@@ -31,6 +31,8 @@ except ImportError:  # numba is optional: fall back to plain Python
 
 
 __all__ = [
+    "converged_prices",
+    "evaluate_surface",
     "DEFAULT_HISTORY_TOLERANCES",
     "DividendCarryCurve",
     "bs_call_price",
@@ -54,9 +56,6 @@ __all__ = [
 ]
 
 
-_QUAD_CACHE = {}
-_EPS = 1e-12
-
 HESTON_PARAM_NAMES = ("v0", "kappa", "theta", "sigma", "rho")
 
 # Tolerances are measured after transformation. log1p(x) corresponds roughly
@@ -79,18 +78,27 @@ GLOBAL_PARAMETER_BOUNDS = {
 }
 
 
+@lru_cache(maxsize=32)
 def _quad_rule(n, max_u):
-    """Cached Gauss-Legendre nodes/weights on [1e-12, max_u]."""
-    key = (int(n), float(max_u))
-    rule = _QUAD_CACHE.get(key)
-    if rule is None:
-        x, w = np.polynomial.legendre.leggauss(int(n))
-        a, b = _EPS, float(max_u)
-        u_nodes = 0.5 * (b - a) * x + 0.5 * (b + a)
-        weights = 0.5 * (b - a) * w
-        rule = (u_nodes, weights)
-        _QUAD_CACHE[key] = rule
-    return rule
+    """Composite Gauss-Legendre avoids ill-conditioned very-high-order rules.
+
+    Keep small requested grids as single-panel rules for legacy diagnostics.
+    At >=128 nodes, graded origin panels resolve CF curvature and panels of at
+    most 32 frequency units preserve tail resolution;
+    n specifies the approximate total node budget (rounded up per panel).
+    """
+    if n >= 128:
+        edges = np.unique(np.r_[0, np.array([.25, .5, 1, 2, 4, 8, 16]),
+                               np.arange(32, max_u, 32), max_u])
+        edges = edges[edges <= max_u]
+        panels = len(edges) - 1
+        per_panel = max(4, int(np.ceil(n / panels)))
+        x, w = roots_legendre(per_panel)
+        widths = np.diff(edges) / 2
+        centers = (edges[1:] + edges[:-1]) / 2
+        return (centers[:, None] + widths[:, None] * x).ravel(), (widths[:, None] * w).ravel()
+    x, w = roots_legendre(n)
+    return (x + 1) * max_u / 2, w * max_u / 2
 
 
 # =============================================================================
@@ -211,148 +219,168 @@ def cumulative_q_at(q_input, T):
 # =============================================================================
 # 1. Black-Scholes with Dividends (for IV conversion)
 # =============================================================================
-def bs_call_price(S0, K, T, r, q, sigma):
-    """Black-Scholes call price with continuous dividend q."""
-    if T <= 0:
-        return max(S0 - K, 0.0)
-    d1 = (np.log(S0 / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-    return S0 * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-
-
-def bs_implied_vol(price, S0, K, T, r, q, opt_type="call"):
-    """Newton-Raphson implied volatility (scalar, kept for compatibility)."""
-    if price <= 0:
+@njit(cache=False)
+def _otm_value_scalar(a, b, volatility, T):
+    """erfc/log-difference equivalent of the vector OTM pricer for optional JIT."""
+    if volatility <= 0:
         return 0.0
-    sigma = 0.3  # initial guess
-    for _ in range(100):
-        d1 = (np.log(S0 / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-        d2 = d1 - sigma * np.sqrt(T)
-        if opt_type == "call":
-            model_price = S0 * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(
-                -r * T
-            ) * norm.cdf(d2)
-            vega = S0 * np.exp(-q * T) * norm.pdf(d1) * np.sqrt(T)
-        else:
-            model_price = K * np.exp(-r * T) * norm.cdf(-d2) - S0 * np.exp(
-                -q * T
-            ) * norm.cdf(-d1)
-            vega = S0 * np.exp(-q * T) * norm.pdf(d1) * np.sqrt(T)
-        if vega < 1e-12:
-            break
-        diff = model_price - price
-        if abs(diff) < 1e-8:
-            break
-        sigma -= diff / vega
-    return sigma
-
-
-# =============================================================================
-# numba kernels (plain-Python fallback if numba is unavailable)
-# =============================================================================
-@njit(cache=False)
-def _norm_cdf_arr(x):
-    """Normal CDF on an array (scalar math.erf is the only erf numba accepts)."""
-    out = np.empty_like(x)
-    for i in range(x.size):
-        out[i] = 0.5 * (1.0 + math.erf(x[i] / math.sqrt(2.0)))
-    return out
-
-
-@njit(cache=False)
-def _norm_pdf_arr(x):
-    """Normal PDF on an array."""
-    return np.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
-
-
-@njit(cache=False)
-def _bs_implied_vol_vec_nb(price, K, S0, T, r, q, is_put, max_iter, tol):
-    """Vectorized Newton-Raphson implied volatility (numba kernel)."""
-    # convert puts to calls via put-call parity
-    price_c = price + is_put * (S0 * np.exp(-q * T) - K * np.exp(-r * T))
-    sigma = np.full(price.shape, 0.3)
-    positive = price > 0
-    active = positive.copy()
-    sqT = np.sqrt(T)
-    for _ in range(max_iter):
-        if not np.any(active):
-            break
-        d1 = (np.log(S0 / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * sqT)
-        d2 = d1 - sigma * sqT
-        model = S0 * np.exp(-q * T) * _norm_cdf_arr(d1) - K * np.exp(
-            -r * T
-        ) * _norm_cdf_arr(d2)
-        vega = S0 * np.exp(-q * T) * _norm_pdf_arr(d1) * sqT
-        diff = model - price_c
-        good_vega = np.abs(vega) > 1e-12
-        step = np.where(good_vega, diff / np.where(good_vega, vega, 1.0), 0.0)
-        sigma_new = np.clip(sigma - step, 1e-6, 5.0)
-        converged = np.abs(diff) < tol
-        sigma = np.where(converged, sigma, sigma_new)
-        active &= ~converged
-    sigma[~positive] = 0.0
-    return sigma
-
-
-def bs_implied_vol_vec(price, S0, K, T, r, q, opt_type="call", max_iter=100, tol=1e-8):
-    """Vectorized Newton-Raphson implied volatility (arrays in, arrays out)."""
-    price = np.atleast_1d(np.asarray(price, dtype=float))
-    K = np.atleast_1d(np.asarray(K, dtype=float))
-    T = float(T)
-    if np.ndim(opt_type) == 0:
-        is_put = np.full(price.shape, opt_type == "put", dtype=bool)
+    root = volatility * math.sqrt(T)
+    d1 = math.log(a / b) / root + root / 2
+    d2 = d1 - root
+    if a <= b:
+        first, second = .5 * math.erfc(-d1 / math.sqrt(2)), .5 * math.erfc(-d2 / math.sqrt(2))
+        first_scale, second_scale = a, b
     else:
-        is_put = np.asarray(opt_type) == "put"
-    return _bs_implied_vol_vec_nb(
-        price, K, S0, T, r, q, is_put, int(max_iter), float(tol)
-    )
+        first, second = .5 * math.erfc(d2 / math.sqrt(2)), .5 * math.erfc(d1 / math.sqrt(2))
+        first_scale, second_scale = b, a
+    if first == 0:
+        return 0.0
+    log_first = math.log(first_scale) + math.log(first)
+    if second == 0:
+        return math.exp(log_first)
+    log_second = math.log(second_scale) + math.log(second)
+    return math.exp(log_first) * (-math.expm1(min(log_second - log_first, 0.0)))
+
+
+@njit(cache=False)
+def _iv_kernel(price, b, puts, a, T, max_iter, tol):
+    """Bracketed Newton, compiled optionally; integer statuses map to public text."""
+    iv = np.full(price.size, np.nan)
+    codes = np.zeros(price.size, dtype=np.int64)
+    for i in range(price.size):
+        p, strike = price[i], b[i]
+        if not math.isfinite(p):
+            continue
+        lower = max(strike - a, 0) if puts[i] else max(a - strike, 0)
+        upper = strike if puts[i] else a
+        slack = 32 * 2.220446049250313e-16 * max(a, strike)
+        if p < lower - slack or p > upper + slack:
+            codes[i] = 1
+            continue
+        tv = p - lower
+        if tv <= 0:
+            iv[i], codes[i] = 0, (2 if tv == 0 else 8)
+            continue
+        if p >= upper:
+            codes[i] = 3
+            continue
+        if T == 0:
+            codes[i] = 4
+            continue
+        lo, hi = 0.0, 1.0
+        for _ in range(12):
+            if _otm_value_scalar(a, strike, hi, T) >= tv:
+                break
+            hi *= 2
+        if _otm_value_scalar(a, strike, hi, T) < tv:
+            codes[i] = 5
+            continue
+        vol, codes[i] = min(.3, hi / 2), 6
+        for _ in range(max_iter):
+            diff = _otm_value_scalar(a, strike, vol, T) - tv
+            if abs(diff) <= min(tol, 1e-11 * abs(tv)) or hi - lo <= 1e-11 * max(1, vol):
+                iv[i], codes[i] = vol, 7
+                break
+            if diff > 0:
+                hi = vol
+            else:
+                lo = vol
+            d1 = math.log(a / strike) / (vol * math.sqrt(T)) + vol * math.sqrt(T) / 2
+            vega = a * math.sqrt(T / (2 * math.pi)) * math.exp(-d1 * d1 / 2)
+            proposal = vol - diff / vega if vega > 0 else math.inf
+            vol = proposal if math.isfinite(proposal) and lo < proposal < hi else (lo + hi) / 2
+    return iv, codes
+
+
+def _bs_time_value(a, b, volatility, T):
+    """Price the OTM leg with log-CDFs to retain low-vega wing precision."""
+    root = np.maximum(np.asarray(volatility), 1e-300) * np.sqrt(T)
+    log_ratio = np.log(a / b)
+    d1 = log_ratio / root + root / 2
+    d2 = d1 - root
+    call = a <= b
+    log_first = np.where(call, np.log(a) + log_ndtr(d1), np.log(b) + log_ndtr(-d2))
+    log_second = np.where(call, np.log(b) + log_ndtr(d2), np.log(a) + log_ndtr(-d1))
+    value = np.exp(log_first) * (-np.expm1(np.minimum(log_second - log_first, 0)))
+    return np.where(np.asarray(volatility) > 0, value, 0.0)
+
+
+def bs_call_price(S0, K, T, r, q, sigma):
+    """Black-Scholes call including the zero-volatility/expiry limits."""
+    K = np.asarray(K, dtype=float)
+    if T <= 0:
+        return np.maximum(S0 - K, 0.0)
+    a, b = S0 * np.exp(-cumulative_q_at(q, T)), K * np.exp(-r * T)
+    return np.maximum(a - b, 0.0) + _bs_time_value(a, b, sigma, T)
+
+
+_IV_STATUSES = np.array(["nonfinite_price", "out_of_bounds", "intrinsic", "upper_bound",
+                         "expiry_mismatch", "unbracketed", "no_convergence", "ok", "roundoff_intrinsic"])
+
+
+def bs_implied_vol_vec(price, S0, K, T, r, q, opt_type="call", max_iter=100,
+                       tol=1e-8, *, return_status=False):
+    """Safeguarded Newton inversion; invalid prices return NaN and a status.
+
+    Bounds allow only 32 machine epsilons of price roundoff. Exactly zero time
+    value has IV=0; the upper bound has no finite IV. Wing convergence is measured
+    relative to time value as well as in price units.
+    """
+    price, K, kinds = np.broadcast_arrays(np.atleast_1d(np.asarray(price, float)),
+                                         np.asarray(K, float), np.asarray(opt_type))
+    if np.any(~np.isin(kinds, ["call", "put"])):
+        raise ValueError("opt_type must be call or put")
+    if T < 0 or S0 <= 0 or np.any(K <= 0):
+        raise ValueError("require T >= 0 and positive S0, K")
+    a, b = S0 * np.exp(-cumulative_q_at(q, T)), K * np.exp(-r * T)
+    iv, codes = _iv_kernel(price.ravel().copy(), b.ravel().copy(), (kinds == "put").ravel().copy(),
+                           float(a), float(T), int(max_iter), float(tol))
+    iv, statuses = iv.reshape(price.shape), _IV_STATUSES[codes].reshape(price.shape)
+    return (iv, statuses) if return_status else iv
+
+
+def bs_implied_vol(price, S0, K, T, r, q, opt_type="call", *, return_status=False):
+    """Scalar wrapper; optional status preserves the default scalar interface."""
+    iv, status = bs_implied_vol_vec(price, S0, K, T, r, q, opt_type, return_status=True)
+    return (float(iv[0]), str(status[0])) if return_status else float(iv[0])
 
 
 # =============================================================================
 # 2. Heston Characteristic Functions (Little Trap)
 # =============================================================================
 @njit(cache=False)
-def _heston_char_funcs_nb(u, T, S0, r, q, v0, kappa, theta, sigma, rho):
-    """Both Heston characteristic functions (Little Trap), j=1 and j=2 (numba kernel)."""
+def _variance_cf_nb(u, T, v0, kappa, theta, sigma, rho, j=2):
+    """Decaying-exponential Little Heston Trap, with consistent C and D."""
+    u = np.asarray(u, dtype=np.complex128)
     iu = 1j * u
-    sigma2 = sigma * sigma
-    a = kappa * theta
-    logS0 = np.log(S0)
-    # j = 1
-    b1 = kappa - rho * sigma
-    d1 = np.sqrt((rho * sigma * iu - b1) ** 2 - sigma2 * (iu - u * u))
-    d1 = np.where(np.real(d1) >= 0, d1, -d1)
-    g1 = (b1 - rho * sigma * iu + d1) / (b1 - rho * sigma * iu - d1)
-    exp1 = np.exp(d1 * T)
-    num1 = 1.0 - g1 * exp1
-    den1 = 1.0 - g1
-    D1 = (b1 - rho * sigma * iu + d1) / sigma2 * ((1.0 - exp1) / (1.0 - g1 * exp1))
-    C1 = (r - q) * iu * T + a / sigma2 * (
-        (b1 - rho * sigma * iu + d1) * T - 2.0 * np.log(num1 / den1)
-    )
-    phi1 = np.exp(C1 + D1 * v0 + iu * logS0)
+    term = (iu if j == 1 else -iu) - u * u
+    if sigma <= 1e-7:
+        integrated = theta * T + (v0 - theta) * (-np.expm1(-kappa * T)) / kappa
+        return np.exp(term * integrated / 2)
+    beta = kappa - (rho * sigma if j == 1 else 0) - rho * sigma * iu
+    d = np.sqrt(beta * beta - sigma * sigma * term)
+    d = np.where(d.real < 0, -d, d)
+    # Exclude analytic endpoints before division, including the first moment.
+    endpoint = term == 0
+    denominator = np.where(endpoint, 1.0, beta + d)
+    h = sigma * sigma * term / denominator
+    g = h / denominator
+    decay = np.exp(-d * T)
+    D = h / (sigma * sigma) * (-np.expm1(-d * T)) / (1 - g * decay)
+    C = kappa * theta / (sigma * sigma) * (
+        h * T - 2 * np.log1p(g * (-np.expm1(-d * T)) / (1 - g)))
+    return np.where(endpoint, 1.0 + 0j, np.exp(C + D * v0))
 
-    # j = 2
-    b2 = kappa
-    d2 = np.sqrt((rho * sigma * iu - b2) ** 2 - sigma2 * (-iu - u * u))
-    d2 = np.where(np.real(d2) >= 0, d2, -d2)
-    g2 = (b2 - rho * sigma * iu + d2) / (b2 - rho * sigma * iu - d2)
-    exp2 = np.exp(d2 * T)
-    num2 = 1.0 - g2 * exp2
-    den2 = 1.0 - g2
-    D2 = (b2 - rho * sigma * iu + d2) / sigma2 * ((1.0 - exp2) / (1.0 - g2 * exp2))
-    C2 = (r - q) * iu * T + a / sigma2 * (
-        (b2 - rho * sigma * iu + d2) * T - 2.0 * np.log(num2 / den2)
-    )
-    phi2 = np.exp(C2 + D2 * v0 + iu * logS0)
-    return phi1, phi2
+
+
 
 
 def heston_char_funcs(u, T, S0, r, q, v0, kappa, theta, sigma, rho):
-    """Both Heston characteristic functions (Little Trap), j=1 and j=2, one pass."""
+    """Both probability-measure CFs; u=0 returns one without division."""
     u = np.asarray(u, dtype=float)
-    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-        return _heston_char_funcs_nb(u, T, S0, r, q, v0, kappa, theta, sigma, rho)
+    phase = np.exp(1j * u * (np.log(S0) + r * T - cumulative_q_at(q, T)))
+    return tuple(phase * _variance_cf(u, T, v0, kappa, theta, sigma, rho, j)
+                 for j in (1, 2))
 
 
 def heston_char_func(u, T, S0, r, q, v0, kappa, theta, sigma, rho, j):
@@ -361,92 +389,46 @@ def heston_char_func(u, T, S0, r, q, v0, kappa, theta, sigma, rho, j):
     return phi1 if j == 1 else phi2
 
 
-@njit(cache=False)
-def _heston_call_prices_nb(S0, K, T, r, q, v0, kappa, theta, sigma, rho, u_nodes, wts):
-    """Heston call prices for a 1D strike array K (numba kernel)."""
-    phi1, phi2 = _heston_char_funcs_nb(
-        u_nodes, T, S0, r, q, v0, kappa, theta, sigma, rho
-    )
-    logK = np.log(K)
-    e = np.exp(-1j * u_nodes[:, None] * logK[None, :])
-    integrand1 = np.real(e * phi1[:, None] / (1j * u_nodes[:, None]))
-    integrand2 = np.real(e * phi2[:, None] / (1j * u_nodes[:, None]))
-    int1 = wts @ integrand1
-    int2 = wts @ integrand2
-    P1 = 0.5 + int1 / np.pi
-    P2 = 0.5 + int2 / np.pi
-    call = S0 * np.exp(-q * T) * P1 - K * np.exp(-r * T) * P2
-    return np.maximum(call, 0.0)
 
 
-def heston_call_prices(S0, K, T, r, q, v0, kappa, theta, sigma, rho, n=64, max_u=500):
-    """Heston call prices for an array of strikes K in ONE vectorized quadrature."""
-    K = np.asarray(K, dtype=float)
-    shape = K.shape
-    K = K.ravel()
+def heston_call_prices(S0, K, T, r, q, v0, kappa, theta, sigma, rho, n=256, max_u=500):
+    """Raw call prices: retain negative/nonfinite integration failures."""
+    K = np.asarray(K, float)
     if T <= 0:
-        return np.maximum(S0 - K, 0.0).reshape(shape)
-    u_nodes, wts = _quad_rule(n, max_u)
-    call = _heston_call_prices_nb(
-        S0, K, T, r, q, v0, kappa, theta, sigma, rho, u_nodes, wts
-    )
-    return call.reshape(shape)
+        return np.maximum(S0 - K, 0)
+    Q = cumulative_q_at(q, T)
+    if sigma <= 1e-7:
+        integrated = theta * T + (v0 - theta) * (-np.expm1(-kappa * T)) / kappa
+        return bs_call_price(S0, K, T, r, q, np.sqrt(integrated / T))
+    u, kernel = _strike_kernel(tuple(K.ravel()), float(np.log(S0) + r * T - Q), int(n), float(max_u))
+    phi1, phi2 = (_variance_cf(u, T, v0, kappa, theta, sigma, rho, j) for j in (1, 2))
+    p1 = 0.5 + np.real(phi1 @ kernel) / np.pi
+    p2 = 0.5 + np.real(phi2 @ kernel) / np.pi
+    return (S0 * np.exp(-Q) * p1 - K.ravel() * np.exp(-r * T) * p2).reshape(K.shape)
 
 
-def heston_call_price(S0, K, T, r, q, v0, kappa, theta, sigma, rho, n=64, max_u=500):
-    """Scalar Heston call price (kept for compatibility)."""
-    if T <= 0:
-        return max(S0 - K, 0.0)
-    return float(
-        heston_call_prices(
-            S0,
-            np.asarray([K], dtype=float),
-            T,
-            r,
-            q,
-            v0,
-            kappa,
-            theta,
-            sigma,
-            rho,
-            n=n,
-            max_u=max_u,
-        )[0]
-    )
+def heston_call_price(S0, K, T, r, q, v0, kappa, theta, sigma, rho, n=256, max_u=500):
+    """Scalar price wrapper."""
+    return float(heston_call_prices(S0, K, T, r, q, v0, kappa, theta, sigma, rho, n, max_u))
 
 
 # =============================================================================
 # 3. Calibration Setup (vectorized)
 # =============================================================================
 def prepare_market(market_data, r, q_curve, S0):
-    """
-    Extract tenors, strikes, target IVs, and q_bar(T) once.
-
-    q_curve can be a DividendCarryCurve or a scalar yield for backward
-    compatibility.  Each prepared group is (T, K, target_iv, q_effective).
-    """
-    T_all = market_data["T"].to_numpy(dtype=float)
-    K_all = market_data["K"].to_numpy(dtype=float)
-    has_iv = "IV" in market_data.columns
-
-    if not has_iv:
-        prices_all = market_data["price"].to_numpy(dtype=float)
-        if "OptionType" in market_data.columns:
-            option_types = market_data["OptionType"].to_numpy()
-        else:
-            option_types = np.array(["call"] * len(market_data))
-
+    """Prepare every tenor without silently dropping invalid market quotes."""
+    if market_data["T"].isna().any():
+        raise ValueError("market contains missing maturities")
     groups = []
-    for T in np.unique(T_all):
-        m = T_all == T
-        q_T = effective_q_at(q_curve, T)
-        if has_iv:
-            target_iv = market_data.loc[m, "IV"].to_numpy(dtype=float)
-        else:
-            target_iv = bs_implied_vol_vec(
-                prices_all[m], S0, K_all[m], T, r, q_T, option_types[m]
-            )
-        groups.append((float(T), K_all[m], target_iv, q_T))
+    for T, sub in market_data.groupby("T", sort=True):
+        K, q = sub["K"].to_numpy(float), effective_q_at(q_curve, T)
+        iv = (sub["IV"].to_numpy(float) if "IV" in sub else
+              bs_implied_vol_vec(sub["price"], S0, K, T, r, q, sub.get("OptionType", "call")))
+        if not np.isfinite(T) or T <= 0 or np.any(~np.isfinite(K)) or np.any(~np.isfinite(iv)) or np.any(iv < 0) or np.any(K <= 0):
+            raise ValueError("market contains invalid maturities, strikes or target IVs")
+        groups.append((float(T), K, iv, q))
+    if not groups:
+        raise ValueError("market_data is empty")
     return groups
 
 
@@ -560,10 +542,12 @@ def historical_parameter_report(
 
 
 def _clip_to_bounds(values, bounds):
+    """Keep warm starts strictly interior to avoid DE scaling-roundoff rejection."""
     values = np.asarray(values, dtype=float)
     lower = np.asarray([bound[0] for bound in bounds], dtype=float)
     upper = np.asarray([bound[1] for bound in bounds], dtype=float)
-    return np.clip(values, lower, upper)
+    margin = (upper - lower) * 1e-12
+    return np.clip(values, lower + margin, upper - margin)
 
 
 def _validate_history_within_global_bounds(history, active_names):
@@ -576,348 +560,170 @@ def _validate_history_within_global_bounds(history, active_names):
             )
 
 
-def compute_iv_error(
-    params,
-    market_data,
-    r,
-    q_curve,
-    S0,
-    penalty_weight=0.0,
-    penalty_sigma=None,
-    historical_params=None,
-    history_penalty_iv=0.0,
-    history_tolerances=None,
-    history_active_names=None,
-    weight_by_T=False,
-    weight_T_floor=0.05,
-    weight_T_power=1.0,
-    iv_cap=0.25,
-    prepared=None,
-    quad_n=64,
-    max_u=500.0,
-):
-    """Weighted mean squared IV error using the dividend curve at each tenor."""
-    v0, kappa, theta, sigma, rho = params
-    if prepared is None:
-        prepared = prepare_market(market_data, r, q_curve, S0)
+def compute_iv_error(params, market_data, r, q_curve, S0, penalty_weight=0.0,
+                     penalty_sigma=None, historical_params=None, history_penalty_iv=0.0,
+                     history_tolerances=None, history_active_names=None, weight_by_T=False,
+                     weight_T_floor=0.05, weight_T_power=1.0, iv_cap=0.25, prepared=None,
+                     quad_n=256, max_u=500.0, *, tenor_weights=None, validate=True,
+                     return_diagnostics=False):
+    """True weighted residual MSE plus explicit regularizers; failures reject.
 
-    total_err = 0.0
-    total_w = 0.0
-    for T, K, target_iv, q_T in prepared:
-        w = 1.0 / (T + weight_T_floor) ** weight_T_power if weight_by_T else 1.0
-        model_price = heston_call_prices(
-            S0, K, T, r, q_T, v0, kappa, theta, sigma, rho, n=quad_n, max_u=max_u
-        )
-        model_iv = bs_implied_vol_vec(model_price, S0, K, T, r, q_T, "call")
-        ok = np.isfinite(model_iv) & (model_iv > 0.0) & (model_iv < 3.0)
-        errs = np.where(ok, (model_iv - target_iv) ** 2, iv_cap)
-        total_err += w * np.sum(errs)
-        total_w += w * K.size
-
-    mse = total_err / total_w if total_w > 0 else 1e10
-
-    if penalty_weight > 0 and penalty_sigma is not None:
-        mse += penalty_weight * (sigma - penalty_sigma) ** 2
-    if historical_params is not None and history_penalty_iv > 0.0:
-        history_distance = historical_parameter_distance(
-            params,
-            historical_params,
-            history_tolerances=history_tolerances,
-            active_names=history_active_names,
-        )
-        mse += float(history_penalty_iv) ** 2 * history_distance
-    return mse
-
-
-def calibrate_heston_gatheral(
-    market_data,
-    r,
-    q_curve,
-    S0,
-    fix_kappa=False,
-    kappa_fixed=2.0,
-    stage1_fixed_rho=-0.7,
-    stage2_penalty=1.0,
-    weight_by_T=False,
-    weight_T_power=1.0,
-    de_quad_n=32,
-    polish_quad_n=64,
-    de_maxiter1=500,
-    de_maxiter2=1000,
-    workers=1,
-    max_u=500.0,
-    use_historical=False,
-    historical_params=None,
-    history_penalty_iv=0.002,
-    history_tolerances=None,
-    warm_start_from_history=True,
-    use_historical_rho_in_stage1=True,
-):
-    """Run two-stage Gatheral calibration with optional historical stability.
-
-    Set ``use_historical=True`` and provide the prior day's five Heston
-    parameters through ``historical_params`` to activate the normalized
-    penalty. ``history_penalty_iv`` is in decimal IV units: ``0.002`` makes an
-    average one-tolerance move cost the same as 0.2 volatility points of IV
-    RMSE. Historical values are also injected into differential evolution when
-    ``warm_start_from_history=True``.
-
-    With ``use_historical=False`` the original optimizer behavior is retained.
+    iv_cap is retained only for call compatibility and never substitutes errors.
+    Zero tenor weight excludes that tenor from optimization, not final diagnostics.
     """
-    prepared = prepare_market(market_data, r, q_curve, S0)
-    if not np.isfinite(history_penalty_iv) or history_penalty_iv < 0.0:
-        raise ValueError("history_penalty_iv must be finite and non-negative")
+    groups = prepared if prepared is not None else prepare_market(market_data, r, q_curve, S0)
+    total, total_w, invalid_iv, integration_failures, included = 0.0, 0.0, 0, 0, 0
+    for T, K, target, q in groups:
+        weight = (T + weight_T_floor) ** (-weight_T_power) if weight_by_T else 1.0
+        weight *= (tenor_weights or {}).get(T, 1.0)
+        if not np.isfinite(weight) or weight < 0:
+            raise ValueError("tenor weights must be finite and non-negative")
+        if weight == 0:
+            continue
+        if validate:
+            price, info = converged_prices(S0, K, T, r, q, params, quad_n, max_u,
+                                          max_refinements=2)
+        else:
+            price = heston_call_prices(S0, K, T, r, q, *params, quad_n, max_u)
+            info = {"converged": False}
+        iv, iv_status = bs_implied_vol_vec(price, S0, K, T, r, q, return_status=True)
+        finite_iv = np.isfinite(iv) & np.isin(iv_status, ["ok", "intrinsic"])
+        valid = finite_iv & (info["converged"] or not validate)
+        invalid_iv += int(np.sum(~finite_iv))
+        included += K.size
+        if validate and not info["converged"]:
+            integration_failures += K.size
+        total += weight * float(np.sum((iv[valid] - target[valid]) ** 2))
+        total_w += weight * np.sum(valid)
+    actual_mse = total / total_w if total_w else np.nan
+    loss = actual_mse if invalid_iv == 0 and integration_failures == 0 and total_w else np.inf
+    if penalty_weight > 0 and penalty_sigma is not None:
+        loss += penalty_weight * (params[3] - penalty_sigma) ** 2
+    if historical_params is not None and history_penalty_iv > 0:
+        loss += history_penalty_iv ** 2 * historical_parameter_distance(
+            params, historical_params, history_tolerances, history_active_names)
+    diagnostics = dict(actual_iv_mse=actual_mse, actual_iv_rmse=float(np.sqrt(actual_mse)),
+                       invalid_count=invalid_iv, integration_failure_count=integration_failures,
+                       included_quotes=included, objective=float(loss),
+                       integration_validation_performed=bool(validate),
+                       integration_status=("failed" if integration_failures else "passed") if validate else "not_checked",
+                       unchecked_quote_count=0 if validate else included)
+    return (loss, diagnostics) if return_diagnostics else loss
 
-    history = None
-    tolerances = None
-    if use_historical:
-        history = _coerce_historical_params(historical_params)
-        tolerances = _resolve_history_tolerances(history_tolerances)
-        active = [
-            name
-            for name in HESTON_PARAM_NAMES
-            if not (fix_kappa and name == "kappa")
-        ]
-        _validate_history_within_global_bounds(history, active)
 
-    rho_stage1 = float(stage1_fixed_rho)
-    if history is not None and use_historical_rho_in_stage1:
-        rho_stage1 = history["rho"]
+def calibrate_heston_gatheral(market_data, r, q_curve, S0, fix_kappa=False,
+                             kappa_fixed=2.0, stage1_fixed_rho=-0.7, stage2_penalty=1.0,
+                             weight_by_T=False, weight_T_power=1.0, de_quad_n=256,
+                             polish_quad_n=256, de_maxiter1=500, de_maxiter2=1000,
+                             workers=1, max_u=500.0, use_historical=False,
+                             historical_params=None, history_penalty_iv=0.002,
+                             history_tolerances=None, warm_start_from_history=True,
+                             use_historical_rho_in_stage1=True, *, tenor_weights=None,
+                             seed=42, popsize=None, stage2_local_bounds=True):
+    """Two-stage calibration with identical weights and converged numerics.
 
-    # --- Stage 1: fit {v0, kappa, theta, sigma} with rho fixed ---
-    bounds_stage1 = [
-        GLOBAL_PARAMETER_BOUNDS["v0"],
-        GLOBAL_PARAMETER_BOUNDS["kappa"],
-        GLOBAL_PARAMETER_BOUNDS["theta"],
-        GLOBAL_PARAMETER_BOUNDS["sigma"],
-    ]
+    Both search and polish start from max(de_quad_n, polish_quad_n, 128), then
+    validate resolution and tail. Exact fixed-kappa bounds replace epsilon ranges.
+    Nested objectives require workers=1; iteration budgets and termination are
+    recorded rather than claiming differential evolution found a global optimum.
+    Default populations remain 20/30 for stages 1/2; popsize overrides both.
+    """
+    if workers != 1:
+        raise ValueError("workers=1 is required for the nested two-stage objectives")
+    if not np.isfinite(history_penalty_iv) or history_penalty_iv < 0 or not np.isfinite(stage2_penalty) or stage2_penalty < 0:
+        raise ValueError("regularization coefficients must be finite and non-negative")
+    n = max(int(de_quad_n), int(polish_quad_n), 128)
+    groups = prepare_market(market_data, r, q_curve, S0)
+    history = _coerce_historical_params(historical_params) if use_historical else None
+    rho1 = history["rho"] if history and use_historical_rho_in_stage1 else stage1_fixed_rho
+    bounds1 = [GLOBAL_PARAMETER_BOUNDS[name] for name in HESTON_PARAM_NAMES[:4]]
     if fix_kappa:
-        if not (
-            GLOBAL_PARAMETER_BOUNDS["kappa"][0]
-            <= kappa_fixed
-            <= GLOBAL_PARAMETER_BOUNDS["kappa"][1]
-        ):
-            raise ValueError("kappa_fixed is outside the global kappa bounds")
-        bounds_stage1[1] = (kappa_fixed - 1e-6, kappa_fixed + 1e-6)
-
-    stage1_active_names = ["v0", "kappa", "theta", "sigma"]
-    if fix_kappa:
-        stage1_active_names.remove("kappa")
-
-    def obj_stage1(params4, quad_n):
-        v0, kappa, theta, sigma = params4
-        full = [v0, kappa, theta, sigma, rho_stage1]
-        return compute_iv_error(
-            full,
-            market_data,
-            r,
-            q_curve,
-            S0,
-            historical_params=history,
-            history_penalty_iv=history_penalty_iv,
-            history_tolerances=tolerances,
-            history_active_names=stage1_active_names,
-            prepared=prepared,
-            quad_n=quad_n,
-            max_u=max_u,
-        )
-
-    de1_extra = {}
-    if history is not None and warm_start_from_history:
-        x0_stage1 = [history[name] for name in HESTON_PARAM_NAMES[:4]]
-        if fix_kappa:
-            x0_stage1[1] = kappa_fixed
-        de1_extra["x0"] = _clip_to_bounds(x0_stage1, bounds_stage1)
-
-    result1 = differential_evolution(
-        lambda p: obj_stage1(p, de_quad_n),
-        bounds_stage1,
-        maxiter=de_maxiter1,
-        popsize=20,
-        tol=1e-8,
-        disp=False,
-        seed=42,
-        polish=False,
-        workers=workers,
-        **de1_extra,
-    )
-    result1 = minimize(
-        lambda p: obj_stage1(p, polish_quad_n),
-        result1.x,
-        method="L-BFGS-B",
-        bounds=bounds_stage1,
-        options={"maxiter": 200},
-    )
-
-    v0_s1, kappa_s1, theta_s1, sigma_s1 = result1.x
-    print(
-        f"Stage 1 complete: v0={v0_s1:.4f}, kappa={kappa_s1:.4f}, "
-        f"theta={theta_s1:.4f}, sigma={sigma_s1:.4f}, "
-        f"fixed rho={rho_stage1:.4f}"
-    )
-
-    # --- Stage 2: fit full smile, free rho and sigma (soft anchor) ---
-    bounds_stage2 = [
-        (v0_s1 * 0.7, v0_s1 * 1.3),
-        (kappa_s1 * 0.5, kappa_s1 * 2.0),
-        (theta_s1 * 0.7, theta_s1 * 1.1),
-        GLOBAL_PARAMETER_BOUNDS["sigma"],
-        GLOBAL_PARAMETER_BOUNDS["rho"],
-    ]
-    if fix_kappa:
-        bounds_stage2[1] = (kappa_s1 - 1e-6, kappa_s1 + 1e-6)
-
-    stage2_active_names = list(HESTON_PARAM_NAMES)
-    if fix_kappa:
-        stage2_active_names.remove("kappa")
-
-    # The historical point must remain feasible in Stage 2; otherwise the
-    # Stage-1-centered bounds could make the prior and warm start unreachable.
+        if not GLOBAL_PARAMETER_BOUNDS["kappa"][0] <= kappa_fixed <= GLOBAL_PARAMETER_BOUNDS["kappa"][1]:
+            raise ValueError("fixed kappa is outside global bounds")
+        bounds1[1] = (kappa_fixed, kappa_fixed)
+    active1 = [name for name in HESTON_PARAM_NAMES[:4] if not (fix_kappa and name == "kappa")]
+    active2 = [name for name in HESTON_PARAM_NAMES if not (fix_kappa and name == "kappa")]
     if history is not None:
-        for index, name in enumerate(HESTON_PARAM_NAMES):
-            if name in stage2_active_names:
-                lower, upper = bounds_stage2[index]
-                bounds_stage2[index] = (
-                    min(lower, history[name]),
-                    max(upper, history[name]),
-                )
+        _validate_history_within_global_bounds(history, active2)
+    common = dict(prepared=groups, quad_n=n, max_u=max_u, historical_params=history,
+                  history_penalty_iv=history_penalty_iv, history_tolerances=history_tolerances,
+                  weight_by_T=weight_by_T, weight_T_power=weight_T_power, tenor_weights=tenor_weights)
 
-    def obj_stage2(params5, quad_n):
-        return compute_iv_error(
-            params5,
-            market_data,
-            r,
-            q_curve,
-            S0,
-            penalty_weight=stage2_penalty,
-            penalty_sigma=sigma_s1,
-            historical_params=history,
-            history_penalty_iv=history_penalty_iv,
-            history_tolerances=tolerances,
-            history_active_names=stage2_active_names,
-            weight_by_T=weight_by_T,
-            weight_T_power=weight_T_power,
-            prepared=prepared,
-            quad_n=quad_n,
-            max_u=max_u,
-        )
+    def obj1(p):
+        return compute_iv_error([*p, rho1], market_data, r, q_curve, S0,
+                                history_active_names=active1, **common)
 
-    de2_extra = {}
-    if history is not None and warm_start_from_history:
-        x0_stage2 = [history[name] for name in HESTON_PARAM_NAMES]
+    def search(objective, bounds, iterations, x0, default_popsize):
+        de = differential_evolution(objective, bounds, seed=seed,
+                                    popsize=popsize if popsize is not None else default_popsize,
+                                    maxiter=iterations, tol=1e-7, atol=1e-10,
+                                    polish=False, x0=x0)
+        local = minimize(objective, de.x, method="L-BFGS-B", bounds=bounds,
+                         options=dict(maxiter=300, ftol=1e-13, gtol=1e-7))
+        best = local if np.isfinite(local.fun) and local.fun <= de.fun else de
+        if not np.isfinite(best.fun):
+            raise RuntimeError("no numerically valid calibration candidate")
+        record = dict(de_success=bool(de.success), de_message=str(de.message),
+                      de_iterations=int(de.nit), local_success=bool(local.success),
+                      local_message=str(local.message), objective=float(best.fun))
+        return best.x, record
+
+    x01 = None
+    if history and warm_start_from_history:
+        x01 = [history[name] for name in HESTON_PARAM_NAMES[:4]]
         if fix_kappa:
-            x0_stage2[1] = kappa_s1
-        de2_extra["x0"] = _clip_to_bounds(x0_stage2, bounds_stage2)
+            x01[1] = kappa_fixed
+        x01 = _clip_to_bounds(x01, bounds1)
+    p1, record1 = search(obj1, bounds1, de_maxiter1, x01, 20)
+    v, k, t, sigma1 = p1
+    bounds2 = [(v * .7, v * 1.3), (k * .5, k * 2), (t * .7, t * 1.1),
+               GLOBAL_PARAMETER_BOUNDS["sigma"], GLOBAL_PARAMETER_BOUNDS["rho"]]
+    if not stage2_local_bounds:
+        bounds2 = [GLOBAL_PARAMETER_BOUNDS[name] for name in HESTON_PARAM_NAMES]
+    for i, name in enumerate(HESTON_PARAM_NAMES):
+        lower, upper = bounds2[i]
+        if history:
+            lower, upper = min(lower, history[name]), max(upper, history[name])
+        gl, gu = GLOBAL_PARAMETER_BOUNDS[name]
+        bounds2[i] = (max(gl, lower), min(gu, upper))
+    if fix_kappa:
+        bounds2[1] = (kappa_fixed, kappa_fixed)
 
-    result2 = differential_evolution(
-        lambda p: obj_stage2(p, de_quad_n),
-        bounds_stage2,
-        maxiter=de_maxiter2,
-        popsize=30,
-        tol=1e-8,
-        disp=False,
-        seed=42,
-        polish=False,
-        workers=workers,
-        **de2_extra,
-    )
-    result2 = minimize(
-        lambda p: obj_stage2(p, polish_quad_n),
-        result2.x,
-        method="L-BFGS-B",
-        bounds=bounds_stage2,
-        options={"maxiter": 200},
-    )
+    def obj2(p):
+        return compute_iv_error(p, market_data, r, q_curve, S0,
+                                penalty_weight=stage2_penalty, penalty_sigma=sigma1,
+                                history_active_names=active2, **common)
 
-    v0, kappa, theta, sigma, rho = result2.x
-    print(
-        f"Stage 2 complete: v0={v0:.4f}, kappa={kappa:.4f}, "
-        f"theta={theta:.4f}, sigma={sigma:.4f}, rho={rho:.4f}"
-    )
-
-    calibrated_params = {
-        "v0": v0,
-        "kappa": kappa,
-        "theta": theta,
-        "sigma": sigma,
-        "rho": rho,
-    }
-
-    # Fitted IVs and curve diagnostics, aligned to original row order.
-    fitted = np.full(len(market_data), np.nan)
-    q_used = np.full(len(market_data), np.nan)
-    Q_used = np.full(len(market_data), np.nan)
-    forwards = np.full(len(market_data), np.nan)
-    T_all = market_data["T"].to_numpy(dtype=float)
-
-    for T, K, _, q_T in prepared:
-        pr = heston_call_prices(
-            S0, K, T, r, q_T, v0, kappa, theta, sigma, rho, n=polish_quad_n, max_u=max_u
-        )
-        iv = bs_implied_vol_vec(pr, S0, K, T, r, q_T, "call")
-        m = T_all == T
-        fitted[m] = iv
-        q_used[m] = q_T
-        Q_T = cumulative_q_at(q_curve, T)
-        Q_used[m] = Q_T
-        forwards[m] = S0 * np.exp(r * T - Q_T)
-
-    result_df = market_data.copy()
-    result_df["q_used"] = q_used
-    result_df["Q_cumulative"] = Q_used
-    result_df["Forward"] = forwards
-    result_df["Fitted_IV"] = fitted
-    if "IV" in market_data.columns:
-        result_df["IV_error"] = result_df["Fitted_IV"] - result_df["IV"]
-
-    # Preserve the existing two-value return signature and expose diagnostics
-    # through DataFrame attrs for callers that want to audit regularization.
-    unpenalized_mse = compute_iv_error(
-        result2.x,
-        market_data,
-        r,
-        q_curve,
-        S0,
-        weight_by_T=weight_by_T,
-        weight_T_power=weight_T_power,
-        prepared=prepared,
-        quad_n=polish_quad_n,
-        max_u=max_u,
-    )
-    diagnostics = {
-        "unpenalized_iv_mse": float(unpenalized_mse),
-        "unpenalized_iv_rmse": float(np.sqrt(unpenalized_mse)),
-        "history_enabled": history is not None,
-        "history_penalty_iv": (
-            float(history_penalty_iv) if history is not None else 0.0
-        ),
-        "history_distance": 0.0,
-        "history_penalty_contribution": 0.0,
-    }
-    if history is not None:
-        distance = historical_parameter_distance(
-            result2.x,
-            history,
-            history_tolerances=tolerances,
-            active_names=stage2_active_names,
-        )
-        diagnostics["history_distance"] = distance
-        diagnostics["history_penalty_contribution"] = (
-            history_penalty_iv**2 * distance
-        )
-        print(f"Unpenalized weighted IV RMSE: {np.sqrt(unpenalized_mse):.6f}")
-        print(f"Historical normalized distance: {distance:.6f}")
-        print(
-            "Historical penalty contribution: "
-            f"{diagnostics['history_penalty_contribution']:.8g}"
-        )
-    result_df.attrs["calibration_diagnostics"] = diagnostics
-
-    return calibrated_params, result_df
+    x02 = ([history[name] for name in HESTON_PARAM_NAMES] if history and
+           warm_start_from_history else [*p1, rho1])
+    p2, record2 = search(obj2, bounds2, de_maxiter2, _clip_to_bounds(x02, bounds2), 30)
+    params = dict(zip(HESTON_PARAM_NAMES, map(float, p2)))
+    # Higher initial resolution is an independent final numerical verification.
+    fitted = evaluate_surface(market_data, params, S0, r, q_curve, n=2 * n, max_u=2 * max_u)
+    loss, diagnostics = compute_iv_error(p2, market_data, r, q_curve, S0,
+                                         history_active_names=active2, penalty_weight=stage2_penalty,
+                                         penalty_sigma=sigma1, return_diagnostics=True, **common)
+    if diagnostics["invalid_count"] or diagnostics["integration_failure_count"] or not fitted["integration_converged"].all() or fitted["Fitted_IV"].isna().any():
+        raise RuntimeError("final calibration fails integration validation")
+    diagnostics.update(stage1=record1, stage2=record2, stage1_params=[*map(float, p1), float(rho1)],
+                       sigma_anchor=float(sigma1), sigma_penalty=float(stage2_penalty * (p2[3] - sigma1) ** 2),
+                       search_quad_n=n, search_max_u=max_u, seed=seed,
+                       unpenalized_iv_rmse=diagnostics["actual_iv_rmse"],
+                       unpenalized_iv_mse=diagnostics["actual_iv_mse"],
+                       history_enabled=history is not None,
+                       history_penalty_iv=float(history_penalty_iv) if history else 0.0,
+                       history_distance=historical_parameter_distance(p2, history, history_tolerances, active2) if history else 0.0)
+    diagnostics["history_penalty_contribution"] = diagnostics["history_penalty_iv"] ** 2 * diagnostics["history_distance"]
+    fitted.attrs["calibration_diagnostics"] = diagnostics
+    return params, fitted
 
 
 def load_vol_surface(file_name):
-    """Load a wide Excel volatility surface into long-form market data."""
+    """Load IV percentages from the supplied path using the 244-day year.
+
+    Notebook callers select their own data directory; tests explicitly supply
+    the restored workbook paths under Further_work.
+    """
     mkt_data = pd.read_excel(file_name)
     mkt_data["expire"] /= 244
 
@@ -948,190 +754,131 @@ def load_vol_surface(file_name):
 # =============================================================================
 
 
-def heston_put_price(S0, K, T, r, q, v0, kappa, theta, sigma, rho, n=64, max_u=500):
-    """Heston put via the same characteristic-function integrals as the call."""
-    if T <= 0:
-        return max(K - S0, 0.0)
-
-    def i1(u):
-        phi1 = heston_char_func(u, T, S0, r, q, v0, kappa, theta, sigma, rho, j=1)
-        return np.real(np.exp(-1j * u * np.log(K)) * phi1 / (1j * u))
-
-    def i2(u):
-        phi2 = heston_char_func(u, T, S0, r, q, v0, kappa, theta, sigma, rho, j=2)
-        return np.real(np.exp(-1j * u * np.log(K)) * phi2 / (1j * u))
-
-    eps = 1e-12
-    P1 = 0.5 + fixed_quad(i1, eps, max_u, n=n)[0] / np.pi  # P(S_T>K) under M1
-    P2 = 0.5 + fixed_quad(i2, eps, max_u, n=n)[0] / np.pi  # under M2
-    put = K * np.exp(-r * T) * (1.0 - P2) - S0 * np.exp(-q * T) * (1.0 - P1)
-    return max(put, 0.0)
+def heston_put_price(S0, K, T, r, q, v0, kappa, theta, sigma, rho, n=256, max_u=500):
+    """Put via parity; preserve raw integration information."""
+    call = heston_call_price(S0, K, T, r, q, v0, kappa, theta, sigma, rho, n, max_u)
+    return call - S0 * np.exp(-cumulative_q_at(q, T)) + K * np.exp(-r * T)
 
 
 def heston_forward_cf(S0, T, r, q, v0, kappa, theta, sigma, rho, s=1.0 - 1e-9):
+    """E[S_T**s] from the same trap formula, approaching the first moment."""
+    value = S0 ** s * np.exp(s * (r * T - cumulative_q_at(q, T)))
+    return float(np.real(value * _variance_cf(np.array([-1j * s]), T, v0, kappa, theta, sigma, rho)[0]))
+
+
+def run_no_arbitrage_checks(md, P, S0, r, q_curve, label, tol_butt=1e-4,
+                            tol_cal=1e-4, fwd_ok=1e-6):
+    """All-tenor bounds, monotonicity, convexity, forward and parity diagnostics.
+
+    Same-strike total-variance comparisons are descriptive with varying forwards;
+    calendar checks require comparing fixed forward moneyness for a formal test.
+    Parity uses constructed puts and is an accounting check, not an independent
+    proof of integration accuracy.
     """
-    E[S_T] via the characteristic function (log MGF), evaluated at s -> 1.
-    E[S_T] = S0 e^((r-q)T) * M_var(s),  M_var(s) = exp(C_v(s)+D_v(s)*v0),
-    and the martingale property gives M_var(1) = 1. s is nudged just below 1
-    to avoid the Little-Trap singularity of the char function exactly at s=1.
-    """
-    d = np.sqrt((kappa - rho * sigma * s) ** 2 + sigma**2 * s * (1.0 - s))
-    g = (kappa - rho * sigma * s + d) / (kappa - rho * sigma * s - d)
-    exp_dT = np.exp(d * T)
-    D = (
-        (kappa - rho * sigma * s + d)
-        / sigma**2
-        * (1.0 - np.exp(-d * T))
-        / (1.0 - g * np.exp(-d * T))
-    )
-    C = (kappa * theta / sigma**2) * (
-        (kappa - rho * sigma * s + d) * T - 2.0 * np.log((1.0 - g * exp_dT) / (1.0 - g))
-    )
-    Mv = np.exp(C + D * v0)
-    return S0 * np.exp((r - q) * T) * Mv
-
-
-def run_no_arbitrage_checks(
-    md, P, S0, r, q_curve, label, tol_butt=1e-4, tol_cal=1e-4, fwd_ok=1e-6
-):
-    v0, kappa, theta, sigma, rho = P["v0"], P["kappa"], P["theta"], P["sigma"], P["rho"]
-    print(f"\n{'=' * 64}\n{label}   (S0={S0}, r={r}, maturity-specific q)\n{'=' * 64}")
-    tenors = np.sort(md["T"].unique())
-
-    print("\nDividend curve used at quoted maturities")
-    for T in tenors:
-        q_T = effective_q_at(q_curve, T)
-        Q_T = cumulative_q_at(q_curve, T)
-        fwd = S0 * np.exp(r * T - Q_T)
-        print(f"    T={T:.6f}: q_eff={q_T:.6%}  Q={Q_T:.8f}  F={fwd:.2f}")
-
-    print("\n[0] true martingale check rho <= kappa/sigma")
-    true_mtg_chck = rho - kappa / sigma
-    print(f"    rho - kappa/sigma = {true_mtg_chck:.4f}")
-
-    print("\n[1] Forward via characteristic function vs S0 exp(rT-Q(T))")
-    fwd_err = 0.0
-    for T in tenors:
-        q_T = effective_q_at(q_curve, T)
-        Q_T = cumulative_q_at(q_curve, T)
-        f_th = S0 * np.exp(r * T - Q_T)
-        f_cf = heston_forward_cf(S0, T, r, q_T, v0, kappa, theta, sigma, rho)
-        rel = abs((f_cf - f_th) / f_th)
-        fwd_err = max(fwd_err, rel)
-        print(f"    T={T:.3f}:  CF={f_cf:10.2f}  theory={f_th:10.2f}  rel={rel:.2e}")
-    print(
-        f"    -> max rel fwd error = {fwd_err:.2e}   {'PASS' if fwd_err < fwd_ok else 'FAIL'}"
-    )
-
-    print("\n[2] Model put-call parity  |C - P - (S0 exp(-Q(T)) - K exp(-rT))|")
-    max_diff, max_rel, npts = 0.0, 0.0, 0
-    for T in tenors[:3]:
-        q_T = effective_q_at(q_curve, T)
-        Q_T = cumulative_q_at(q_curve, T)
-        sub = md[np.isclose(md["T"], T)].sort_values("K")
-        Ks = sub["K"].values
-        for K in Ks[:: max(1, len(Ks) // 4)]:
-            C = heston_call_price(S0, K, T, r, q_T, v0, kappa, theta, sigma, rho)
-            Pp = heston_put_price(S0, K, T, r, q_T, v0, kappa, theta, sigma, rho)
-            parity = S0 * np.exp(-Q_T) - K * np.exp(-r * T)
-            d = abs(C - Pp - parity)
-            max_diff = max(max_diff, d)
-            max_rel = max(max_rel, d / (K * np.exp(-r * T)))
-            npts += 1
-    print(
-        f"    ({npts} pts)  max |C-P-parity| = {max_diff:.2e}   max rel = {max_rel:.2e}"
-    )
-
-    def slope_viol(Cs, Ks, tol):
-        slopes = np.diff(Cs) / np.diff(Ks)
-        dv = np.diff(slopes)
-        bad = dv < -tol
-        return int(bad.sum()), (float(-dv[bad].min()) if bad.any() else 0.0)
-
-    print(
-        "\n[3] Butterfly (convexity): call-slope decreases -> violations (tol %.0e)"
-        % tol_butt
-    )
-    print(
-        f"    {'T':>7} | {'mkt viol':>8} {'mkt max':>10} | {'model viol':>10} {'model max':>10}"
-    )
-    for T in tenors:
-        q_T = effective_q_at(q_curve, T)
-        sub = md[np.isclose(md["T"], T)].sort_values("K").reset_index(drop=True)
-        if len(sub) < 3:
-            continue
-        Ks = sub["K"].values
-        Cs_m = np.array(
-            [
-                bs_call_price(S0, Ks[i], T, r, q_T, sub["IV"].values[i])
-                for i in range(len(Ks))
-            ]
-        )
-        Cs_M = np.array(
-            [
-                heston_call_price(S0, Ks[i], T, r, q_T, v0, kappa, theta, sigma, rho)
-                for i in range(len(Ks))
-            ]
-        )
-        nv_m, mx_m = slope_viol(Cs_m, Ks, tol_butt)
-        nv_M, mx_M = slope_viol(Cs_M, Ks, tol_butt)
-        print(f"    {T:.3f} | {nv_m:8d} {mx_m:10.2e} | {nv_M:10d} {mx_M:10.2e}")
-
-    print(
-        "\n[4] Calendar: total variance w=IV^2*T non-decreasing in T (per strike, tol %.0e)"
-        % tol_cal
-    )
-    mdw = md.copy()
-    mdw["w"] = mdw["IV"] ** 2 * mdw["T"]
-    viol_m, viol_M, nchecks, maxdec_m, maxdec_M = 0, 0, 0, 0.0, 0.0
-    for K in sorted(mdw["K"].unique()):
-        sub = mdw[mdw["K"] == K].sort_values("T")
-        if len(sub) < 2:
-            continue
-        Ts = sub["T"].values
-        wm = sub["w"].values
-        wM = np.array(
-            [
-                bs_implied_vol(
-                    heston_call_price(
-                        S0,
-                        K,
-                        T,
-                        r,
-                        effective_q_at(q_curve, T),
-                        v0,
-                        kappa,
-                        theta,
-                        sigma,
-                        rho,
-                    ),
-                    S0,
-                    K,
-                    T,
-                    r,
-                    effective_q_at(q_curve, T),
-                    "call",
-                )
-                ** 2
-                * T
-                for T in Ts
-            ]
-        )
-        for i in range(len(Ts) - 1):
-            nchecks += 1
-            if wm[i + 1] < wm[i] - tol_cal:
-                viol_m += 1
-                maxdec_m = max(maxdec_m, wm[i] - wm[i + 1])
-            if wM[i + 1] < wM[i] - tol_cal:
-                viol_M += 1
-                maxdec_M = max(maxdec_M, wM[i] - wM[i + 1])
-    print(
-        f"    {nchecks} adjacent-T checks: market viol={viol_m} "
-        f"(max dec {maxdec_m:.2e}) | model viol={viol_M} "
-        f"(max dec {maxdec_M:.2e})"
-    )
+    fitted = evaluate_surface(md, P, S0, r, q_curve)
+    rows = []
+    for T, sub in fitted.groupby("T", sort=True):
+        sub = sub.sort_values("K")
+        K, C, q = sub["K"].to_numpy(), sub["model_price"].to_numpy(), effective_q_at(q_curve, T)
+        a, b = S0 * np.exp(-q * T), K * np.exp(-r * T)
+        slopes = np.diff(C) / np.diff(K)
+        puts = C - a + b
+        forward = S0 * np.exp((r - q) * T)
+        cf = heston_forward_cf(S0, T, r, q, *(P[name] for name in HESTON_PARAM_NAMES))
+        rows.append(dict(T=T, quote_count=len(sub), invalid_iv=int(sub["Fitted_IV"].isna().sum()),
+                         integration_failures=int((~sub["integration_converged"].astype(bool)).sum()),
+                         bound_violations=int(np.sum((C < np.maximum(a - b, 0) - 1e-7) | (C > a + 1e-7))),
+                         monotonic_violations=int(np.sum(slopes > tol_butt)),
+                         convexity_violations=int(np.sum(np.diff(slopes) < -tol_butt)),
+                         max_parity_error=float(np.max(np.abs(C - puts - (a - b)))),
+                         forward_relative_error=float(abs(cf / forward - 1))))
+    table = pd.DataFrame(rows)
+    print(label + "\n" + table.to_string(index=False))
+    table.attrs["same_strike_variance_decreases"] = int(
+        fitted.assign(w=fitted["Fitted_IV"] ** 2 * fitted["T"])
+        .sort_values(["K", "T"]).groupby("K")["w"].diff().lt(-tol_cal).sum())
+    table.attrs["forward_pass"] = bool((table["forward_relative_error"] < fwd_ok).all())
+    return table
 
 
 # Backward-compatible names used by the legacy notebooks.
 data_processer = load_vol_surface
 no_arb_checks = run_no_arbitrage_checks
+
+
+@lru_cache(maxsize=64)
+def _strike_kernel(strikes, log_forward, n, max_u):
+    """Cache strike phases; forward centering reduces cancellation in CFs."""
+    u, w = _quad_rule(n, max_u)
+    return u, np.exp(1j * u[:, None] * (log_forward - np.log(strikes))) * (w / (1j * u))[:, None]
+
+
+def converged_prices(S0, K, T, r, q, params, n=256, max_u=500, *,
+                     price_tol=2e-7, iv_tol=2e-6, max_refinements=3):
+    """Check both node refinement and tail extension before accepting prices.
+
+    Each level doubles nodes at fixed cutoff, then doubles cutoff with doubled
+    nodes again. Failed convergence is explicit and calibration rejects it.
+    """
+    K = np.asarray(K, float)
+    coarse = heston_call_prices(S0, K, T, r, q, *params, n, max_u)
+    info = {"converged": False, "n": int(n), "max_u": float(max_u),
+            "validation_performed": True, "status": "failed"}
+    for _ in range(max_refinements):
+        if 4 * n > 8192:
+            break
+        fine = heston_call_prices(S0, K, T, r, q, *params, 2 * n, max_u)
+        tail = heston_call_prices(S0, K, T, r, q, *params, 4 * n, 2 * max_u)
+        iv0, s0 = bs_implied_vol_vec(coarse, S0, K, T, r, q, return_status=True)
+        iv1, s1 = bs_implied_vol_vec(fine, S0, K, T, r, q, return_status=True)
+        iv2, s2 = bs_implied_vol_vec(tail, S0, K, T, r, q, return_status=True)
+        finite = (np.isfinite(iv0) & np.isfinite(iv1) & np.isfinite(iv2) &
+                  np.isin(s0, ["ok", "intrinsic"]) & np.isin(s1, ["ok", "intrinsic"]) & np.isin(s2, ["ok", "intrinsic"]))
+        price_gap = max(float(np.max(np.abs(fine - coarse))), float(np.max(np.abs(tail - fine))))
+        iv_gap = max(float(np.max(np.abs(iv1 - iv0))), float(np.max(np.abs(iv2 - iv1))))
+        info.update(n=int(4 * n), max_u=float(2 * max_u), price_gap=price_gap,
+                    iv_gap=iv_gap, invalid_count=int(np.sum(~finite)))
+        if finite.all() and price_gap <= price_tol and iv_gap <= iv_tol:
+            info["converged"] = True
+            info["status"] = "passed"
+            return tail, info
+        coarse, n, max_u = tail, 4 * n, 2 * max_u
+    return coarse, info
+
+
+def evaluate_surface(market_data, params, S0, r, q_curve, *, n=256, max_u=500,
+                     validate=True):
+    """Reprice any parameter set, retaining per-quote failure/convergence status."""
+    result = market_data.copy()
+    result["integration_converged"] = False
+    result["integration_validation_performed"] = bool(validate)
+    for T, sub in market_data.groupby("T", sort=True):
+        K, q = sub["K"].to_numpy(float), effective_q_at(q_curve, T)
+        if validate:
+            p = [params[name] for name in HESTON_PARAM_NAMES] if isinstance(params, dict) else params
+            prices, info = converged_prices(S0, K, T, r, q, p, n, max_u)
+        else:
+            p = [params[name] for name in HESTON_PARAM_NAMES] if isinstance(params, dict) else params
+            prices = heston_call_prices(S0, K, T, r, q, *p, n, max_u)
+            info = dict(converged=False, n=n, max_u=max_u, status="not_checked")
+        iv, status = bs_implied_vol_vec(prices, S0, K, T, r, q, return_status=True)
+        result.loc[sub.index, "model_price"] = prices
+        result.loc[sub.index, "Fitted_IV"] = iv
+        result.loc[sub.index, "iv_status"] = status
+        result.loc[sub.index, "integration_converged"] = info["converged"]
+        result.loc[sub.index, "integration_status"] = info["status"]
+        result.loc[sub.index, "quad_n"] = info["n"]
+        result.loc[sub.index, "max_u"] = info["max_u"]
+        result.loc[sub.index, "q_used"] = q
+        result.loc[sub.index, "Q_cumulative"] = cumulative_q_at(q_curve, T)
+        result.loc[sub.index, "Forward"] = S0 * np.exp(r * T - cumulative_q_at(q_curve, T))
+    if "IV" in result:
+        result["IV_error"] = result["Fitted_IV"] - result["IV"]
+    return result
+
+
+def _variance_cf(u, T, v0, kappa, theta, sigma, rho, j=2):
+    """Normalize scalar/vector inputs for the shared stable Numba CF kernel."""
+    u = np.asarray(u, dtype=np.complex128)
+    value = _variance_cf_nb(u.ravel(), T, v0, kappa, theta, sigma, rho, j)
+    return value.reshape(u.shape)
